@@ -231,7 +231,7 @@ with st.sidebar:
             f'<span style="opacity:0.7">{count} scholarships · updated {ts}</span></div>',
             unsafe_allow_html=True,
         )
-        if st.button("🗑  Clear Database", use_container_width=True):
+        if st.button("🗑  Clear Database", use_container_width=True, key="btn_clear_db"):
             os.remove(DB_PATH)
             st.session_state.scholarships_df = None
             st.session_state.matches_df      = None
@@ -292,6 +292,7 @@ with tab1:
         with btn_col:
             scout_clicked = st.button(
                 "🚀  Start Scout",
+                key="scout_btn",
                 type="primary",
                 disabled=st.session_state.is_scouting,
                 use_container_width=True,
@@ -412,24 +413,6 @@ with tab1:
             first_gen, income_based, True  # always includes catch-all
         ])
         est_minutes = max(1, round((angles_preview * max_results * 4) / 60))
-        st.caption(
-            f"⏱ Estimated time: **{est_minutes}–{est_minutes + 1} min** "
-            f"({angles_preview} search angles × {max_results} URLs each, ~4s per site). "
-            "Feel free to grab a coffee — this runs in the background."
-        )
-
-        btn_col, _ = st.columns([2, 3])
-        with btn_col:
-            scout_clicked = st.button(
-                "🚀  Start Scout",
-                type="primary",
-                disabled=st.session_state.is_scouting,
-                use_container_width=True,
-            )
-
-        if scout_clicked:
-            st.session_state.is_scouting = True
-            st.rerun()
 
         if st.session_state.is_scouting:
             with st.status("Scouting the web — this may take a few minutes...", expanded=True) as status:
@@ -606,6 +589,7 @@ with tab3:
                 type="primary",
                 disabled=st.session_state.is_drafting,
                 use_container_width=True,
+                key="btn_draft",
             )
 
         if draft_clicked and not st.session_state.is_drafting:
