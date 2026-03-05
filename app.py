@@ -22,8 +22,11 @@ st.set_page_config(
 st.markdown("""
 <style>
 /* Hide Streamlit chrome */
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; }
 .stDeployButton { display: none; }
+/* Hide "Made with Streamlit" but keep the header so sidebar toggle works */
+[data-testid="stHeader"] { background: transparent; }
 
 /* Card component */
 .card {
