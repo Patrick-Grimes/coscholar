@@ -1,0 +1,18 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.csv
+
+# Personal API Keys
+.env
+
+# Local Data (Don't upload your private search results)
+scholarship_database.csv
+matches_to_apply.csv
+Draft_*.txt
+
+# OS specific files
+.DS_Store
+Thumbs.db
