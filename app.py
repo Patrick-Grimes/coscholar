@@ -215,7 +215,7 @@ with st.sidebar:
     st.divider()
 
     # Applicant profile / resume
-    st.markdown('<div class="slabel">Applicant Profile</div>', unsafe_allow_html=True)
+    st.markdown('<div class="slabel">Supplemental Information</div>', unsafe_allow_html=True)
     st.caption(
         "Upload files such as resumes, cover letters, or previous applications,"
         "and paste anything else in the text box - The more detail, the better the filtering and cover letters!"
