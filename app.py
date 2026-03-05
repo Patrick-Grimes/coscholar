@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import datetime
 from io import StringIO
 
 from agent import find_scholarship_urls
@@ -18,34 +19,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Global CSS ────────────────────────────────────────────────────────────────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Hide Streamlit chrome */
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
 .stDeployButton { display: none; }
-/* Hide "Made with Streamlit" but keep the header so sidebar toggle works */
 [data-testid="stHeader"] { background: transparent; }
 
-/* Card component */
-.card {
-    background: #1a1d27;
-    border: 1px solid #2d3148;
-    border-radius: 12px;
-    padding: 1.5rem;
-    margin-bottom: 1rem;
-}
-
-/* Metric override */
 [data-testid="metric-container"] {
     background: #1a1d27;
     border: 1px solid #2d3148;
     border-radius: 10px;
     padding: 1rem 1.25rem;
 }
-
-/* Mono tag */
 .tag {
     display: inline-block;
     font-family: monospace;
@@ -59,46 +46,16 @@ footer { visibility: hidden; }
     text-transform: uppercase;
     margin-bottom: 0.4rem;
 }
-
-/* Step header */
-.step-title {
-    font-size: 1.3rem;
-    font-weight: 700;
-    margin: 0.25rem 0 0.2rem 0;
-}
-.step-sub {
-    color: #64748b;
-    font-size: 0.875rem;
-    margin-bottom: 1.25rem;
-}
-
-/* Draft body text */
-.draft-body {
-    font-size: 0.9rem;
-    line-height: 1.7;
-    color: #cbd5e1;
-    white-space: pre-wrap;
-}
-
-/* Sidebar section label */
+.step-title { font-size: 1.3rem; font-weight: 700; margin: 0.25rem 0 0.2rem 0; }
+.step-sub   { color: #64748b; font-size: 0.875rem; margin-bottom: 1.25rem; }
+.draft-body { font-size: 0.9rem; line-height: 1.7; color: #cbd5e1; white-space: pre-wrap; }
 .slabel {
-    font-size: 0.65rem;
-    font-family: monospace;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: #475569;
-    margin: 1.1rem 0 0.3rem 0;
+    font-size: 0.65rem; font-family: monospace; letter-spacing: 0.12em;
+    text-transform: uppercase; color: #475569; margin: 1.1rem 0 0.3rem 0;
 }
-
-/* Database status pill */
 .status-loaded {
-    background: #4ade8015;
-    border: 1px solid #4ade8030;
-    border-radius: 8px;
-    padding: 0.6rem 1rem;
-    font-size: 0.85rem;
-    color: #4ade80;
-    margin-bottom: 1rem;
+    background: #4ade8015; border: 1px solid #4ade8030; border-radius: 8px;
+    padding: 0.6rem 1rem; font-size: 0.85rem; color: #4ade80; margin-bottom: 1rem;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -108,10 +65,34 @@ footer { visibility: hidden; }
 
 @st.cache_data
 def load_csv(path: str) -> pd.DataFrame:
-    """Cached CSV loader — fast on reruns, auto-busted when we call load_csv.clear()."""
     df = pd.read_csv(path)
     df["min_gpa"] = pd.to_numeric(df["min_gpa"], errors="coerce").fillna(0.0)
     return df
+
+
+# Key terms for fuzzy major matching — maps common shorthand to full names
+MAJOR_ALIASES = {
+    "computer science": ["cs", "comp sci", "computer science", "computing", "software"],
+    "data science":     ["data science", "data analytics", "data analysis", "analytics"],
+    "engineering":      ["engineering", "engineer"],
+    "business":         ["business", "finance", "accounting", "economics", "econ"],
+    "biology":          ["biology", "bio", "life science", "biological"],
+    "psychology":       ["psychology", "psych"],
+    "nursing":          ["nursing", "nurse", "rn"],
+    "math":             ["math", "mathematics", "statistics", "stats"],
+}
+
+def major_terms(major: str) -> list[str]:
+    """Returns a list of terms to match against for a given major input."""
+    m = major.lower().strip()
+    for key, aliases in MAJOR_ALIASES.items():
+        if m in aliases or m == key:
+            return aliases
+    # Fallback: just use the input itself + first word
+    terms = [m]
+    if " " in m:
+        terms.append(m.split()[0])
+    return terms
 
 
 def filter_matches(
@@ -123,34 +104,71 @@ def filter_matches(
     first_gen: bool = False,
     income_based: bool = False,
 ) -> pd.DataFrame:
-    def open_or_match(col, value):
-        """True if the column is blank/empty (open to all) OR contains the value."""
-        s = df.get(col, pd.Series([""] * len(df))).astype(str).str.strip()
-        return s.str.contains(value, case=False, regex=False) | (s == "") | (s == "[]") | (s.str.lower() == "nan")
 
-    gpa_mask   = df["min_gpa"] <= gpa
-    major_mask = open_or_match("majors", major)
-    state_mask = open_or_match("eligible_states", state) if state else pd.Series([True] * len(df))
-    eth_mask   = open_or_match("ethnicity", ethnicity) if ethnicity else pd.Series([True] * len(df))
+    def col(name):
+        return df.get(name, pd.Series([""] * len(df))).astype(str).str.strip()
 
-    # For boolean flags: only filter OUT scholarships that explicitly require
-    # a trait the student doesn't have (not the other way around)
-    first_gen_col = df.get("first_gen", pd.Series([False] * len(df)))
-    first_gen_mask = (~first_gen_col.astype(str).str.lower().isin(["true", "1"])) | pd.Series([first_gen] * len(df))
+    def is_open(series):
+        """True if the field is blank/empty/null — meaning open to all."""
+        return series.isin(["", "[]", "nan", "None", "none"])
 
-    income_col = df.get("income_based", pd.Series([False] * len(df)))
-    income_mask = (~income_col.astype(str).str.lower().isin(["true", "1"])) | pd.Series([income_based] * len(df))
+    # GPA — only filter if scholarship has a real GPA requirement
+    gpa_mask = df["min_gpa"] <= gpa
 
-    return df[gpa_mask & major_mask & state_mask & eth_mask & first_gen_mask & income_mask].copy()
+    # Major — open to all OR contains any alias for the entered major
+    major_col = col("majors")
+    terms = major_terms(major)
+    major_match = pd.Series([False] * len(df))
+    for term in terms:
+        major_match = major_match | major_col.str.contains(term, case=False, regex=False)
+    major_mask = is_open(major_col) | major_match
+
+    # State — open to all OR contains user's state
+    state_col = col("eligible_states")
+    state_mask = (
+        is_open(state_col) |
+        state_col.str.contains(state, case=False, regex=False)
+    ) if state else pd.Series([True] * len(df))
+
+    # Ethnicity — open to all OR matches user's ethnicity
+    # Key fix: if user entered ethnicity, we keep scholarships open to all
+    # AND scholarships explicitly for their ethnicity
+    eth_col = col("ethnicity")
+    if ethnicity:
+        eth_mask = is_open(eth_col) | eth_col.str.contains(ethnicity, case=False, regex=False)
+    else:
+        eth_mask = pd.Series([True] * len(df))
+
+    # First-gen — only filter OUT scholarships that require first-gen if user isn't
+    fg_col = col("first_gen")
+    first_gen_mask = (
+        ~fg_col.str.lower().isin(["true", "1"]) |
+        pd.Series([first_gen] * len(df))
+    )
+
+    # Income — only filter OUT need-based if user didn't check it
+    inc_col = col("income_based")
+    income_mask = (
+        ~inc_col.str.lower().isin(["true", "1"]) |
+        pd.Series([income_based] * len(df))
+    )
+
+    mask = gpa_mask & major_mask & state_mask & eth_mask & first_gen_mask & income_mask
+    return df[mask].copy()
 
 
-# ── Session state init ────────────────────────────────────────────────────────
-for key, default in [("scholarships_df", None), ("matches_df", None), ("drafts", {}), ("is_scouting", False), ("is_drafting", False), ("scout_done", False)]:
+# ── Session state ─────────────────────────────────────────────────────────────
+for key, default in [
+    ("scholarships_df", None),
+    ("matches_df",      None),
+    ("drafts",          {}),
+    ("is_scouting",     False),
+    ("is_drafting",     False),
+    ("scout_done",      False),
+]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# AUTO-LOAD: if database exists on disk and session is fresh, load it in
-# This is how we survive browser refreshes — the CSV is the persistence layer
 DB_PATH = "scholarship_database.csv"
 if st.session_state.scholarships_df is None and os.path.exists(DB_PATH):
     st.session_state.scholarships_df = load_csv(DB_PATH)
@@ -162,6 +180,7 @@ with st.sidebar:
     st.caption("Autonomous Scholarship Agent · Powered by Gemini")
     st.divider()
 
+    # API Key
     st.markdown('<div class="slabel">Gemini API Key</div>', unsafe_allow_html=True)
     user_api_key = st.text_input(
         "Gemini API Key",
@@ -176,48 +195,53 @@ with st.sidebar:
 
     st.divider()
 
+    # Profile
     st.markdown('<div class="slabel">Profile</div>', unsafe_allow_html=True)
-    name  = st.text_input("Full Name", placeholder="Jane Smith")
-    major = st.text_input("Major / Field", placeholder="Computer Science")
-    gpa   = st.number_input("GPA", min_value=0.0, max_value=4.0, step=0.1, format="%.1f")
-    state     = st.text_input("State (2-letter)", placeholder="NC", max_chars=2).upper()
-    ethnicity = st.text_input("Ethnicity (optional)", placeholder="e.g. Hispanic, Black, Asian, white")
-    first_gen = st.checkbox("First-generation college student")
+    name         = st.text_input("Full Name",         placeholder="Jane Smith")
+    major        = st.text_input("Major / Field",     placeholder="Computer Science")
+    gpa          = st.number_input("GPA", min_value=0.0, max_value=4.0, step=0.1, format="%.1f")
+    state        = st.text_input("State (2-letter)",  placeholder="NC", max_chars=2).upper()
+    ethnicity    = st.text_input("Ethnicity (optional)", placeholder="e.g. Hispanic, Black, Asian, white")
+    first_gen    = st.checkbox("First-generation college student")
     income_based = st.checkbox("Financial need / income-based")
 
-    # Auto-filter whenever sidebar profile changes
+    # Auto-filter on profile change
     if st.session_state.scholarships_df is not None and major.strip() and gpa > 0:
         st.session_state.matches_df = filter_matches(
             st.session_state.scholarships_df, major, gpa, state,
             ethnicity, first_gen, income_based,
         )
 
+    st.divider()
+
+    # Applicant profile / resume
     st.markdown('<div class="slabel">Applicant Profile</div>', unsafe_allow_html=True)
     st.caption(
         "Include anything relevant: demographics, ethnicity, income level, "
-        "first-gen status, GPA, state, projects, skills, and goals. "
-        "The more detail, the better the filtering and cover letters."
+        "first-gen status, GPA, state, projects, skills, and goals."
     )
 
-    uploaded_file = st.file_uploader(
-        "Upload resume (.txt or .pdf)",
+    # Multiple file upload
+    uploaded_files = st.file_uploader(
+        "Upload resume(s) (.txt or .pdf)",
         type=["txt", "pdf"],
+        accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
     uploaded_text = ""
-    if uploaded_file:
-        if uploaded_file.type == "text/plain":
-            uploaded_text = uploaded_file.read().decode("utf-8", errors="ignore")
-            st.success(f"✅ {uploaded_file.name}")
-        elif uploaded_file.type == "application/pdf":
+    for f in uploaded_files:
+        if f.type == "text/plain":
+            uploaded_text += f.read().decode("utf-8", errors="ignore") + "\n\n"
+            st.success(f"✅ {f.name}")
+        elif f.type == "application/pdf":
             try:
                 import pdfplumber, io
-                with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
-                    uploaded_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-                st.success(f"✅ {uploaded_file.name}")
+                with pdfplumber.open(io.BytesIO(f.read())) as pdf:
+                    uploaded_text += "\n".join(p.extract_text() or "" for p in pdf.pages) + "\n\n"
+                st.success(f"✅ {f.name}")
             except Exception as e:
-                st.warning(f"PDF parse error: {e}")
+                st.warning(f"PDF parse error ({f.name}): {e}")
 
     pasted_text = st.text_area(
         "Or paste your profile here",
@@ -237,15 +261,14 @@ with st.sidebar:
     st.markdown('<div class="slabel">Search Settings</div>', unsafe_allow_html=True)
     max_results = st.slider("URLs to Scout", 1, 10, 3)
 
-    # Database status footer
+    # DB status
     st.divider()
     if os.path.exists(DB_PATH):
-        import datetime
         ts    = datetime.datetime.fromtimestamp(os.path.getmtime(DB_PATH)).strftime("%b %d · %I:%M %p")
         count = len(pd.read_csv(DB_PATH))
         st.markdown(
             f'<div class="status-loaded">📂 Database loaded<br>'
-            f'<span style="opacity:0.7">{count} scholarships · updated {ts}</span></div>',
+            f'<span style="opacity:0.7">{count} scholarships · {ts}</span></div>',
             unsafe_allow_html=True,
         )
         if st.button("🗑  Clear Database", use_container_width=True, key="btn_clear_db"):
@@ -259,7 +282,7 @@ with st.sidebar:
         st.caption("No database yet. Run a Scout to build one.")
 
 
-# ── Main area ─────────────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 title_col, pill_col = st.columns([5, 1])
 with title_col:
     st.markdown("# CoScholar **AI**")
@@ -275,6 +298,7 @@ with pill_col:
 
 st.divider()
 
+# ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["  🔍  Scout  ", "  📋  Matches  ", "  ✏️  Drafts  "])
 
 
@@ -285,8 +309,8 @@ with tab1:
     st.markdown('<div class="tag">Step 01</div>', unsafe_allow_html=True)
     st.markdown('<div class="step-title">Scout Scholarships</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="step-sub">Searches the web for scholarship listing pages, '
-        'scrapes them with Gemini, and saves results to your local database.</div>',
+        '<div class="step-sub">Searches the web across multiple eligibility dimensions, '
+        'scrapes each page with Gemini, and saves results to your local database.</div>',
         unsafe_allow_html=True,
     )
 
@@ -296,28 +320,30 @@ with tab1:
     if not api_key_set:
         st.warning("👈  Paste your Gemini API key in the sidebar to get started.")
     elif not profile_ready:
-        st.info("👈  Fill in your Name, Major, and GPA in the sidebar to get started.")
+        if st.session_state.scholarships_df is not None:
+            st.info(
+                f"📂 **{len(st.session_state.scholarships_df)} scholarships already in your database.** "
+                "👈 Fill in your Name, Major, and GPA in the sidebar — matches will populate instantly without re-scouting."
+            )
+        else:
+            st.info("👈  Fill in your Name, Major, and GPA in the sidebar to get started.")
     else:
-        # Estimate runtime so user isn't surprised
-        angles_preview = sum([
-            bool(major), bool(state), bool(ethnicity),
-            first_gen, income_based, True  # always includes catch-all
-        ])
-        est_minutes = max(1, round((angles_preview * max_results * 4) / 60))
+        angles_preview = sum([bool(major), bool(state), bool(ethnicity), first_gen, income_based, True])
+        est_min = max(1, round((angles_preview * max_results * 4) / 60))
         st.caption(
-            f"⏱ Estimated time: **{est_minutes}–{est_minutes + 1} min** "
+            f"⏱ Estimated time: **{est_min}–{est_min + 1} min** "
             f"({angles_preview} search angles × {max_results} URLs each, ~4s per site). "
-            "Feel free to grab a coffee — this runs in the background."
+            "Feel free to grab a coffee ☕"
         )
 
         btn_col, _ = st.columns([2, 3])
         with btn_col:
             scout_clicked = st.button(
                 "🚀  Start Scout",
-                key="scout_btn",
                 type="primary",
                 disabled=st.session_state.is_scouting,
                 use_container_width=True,
+                key="btn_scout",
             )
 
         if scout_clicked:
@@ -325,7 +351,7 @@ with tab1:
             st.rerun()
 
         if st.session_state.is_scouting:
-            with st.status("Scouting the web — grab a coffee, this takes a few minutes ☕", expanded=True) as status:
+            with st.status("Scouting the web — this may take a few minutes...", expanded=True) as status:
                 angles = []
                 if major:        angles.append(f"major ({major})")
                 if state:        angles.append(f"state ({state})")
@@ -357,12 +383,12 @@ with tab1:
                 if not urls:
                     st.session_state.is_scouting = False
                     status.update(
-                        label="⚠️ No URLs found. Try broadening your profile or increasing URLs to Scout.",
+                        label="⚠️ No URLs found. Try increasing URLs to Scout in the sidebar.",
                         state="error", expanded=False,
                     )
                     st.stop()
 
-                st.write(f"📡 Found **{len(urls)} unique URLs**. Scraping each site with Gemini...")
+                st.write(f"📡 Found **{len(urls)} unique URLs**. Scraping with Gemini...")
 
                 counter_box  = st.empty()
                 progress_bar = st.progress(0)
@@ -398,46 +424,71 @@ with tab1:
                         )
                     else:
                         status.update(
-                            label=f"✅ Scout complete — {len(df)} active scholarships · {len(matches)} match your profile.",
+                            label=f"✅ Scout complete — {len(df)} scholarships found · {len(matches)} match your profile.",
                             state="complete", expanded=False,
                         )
                 else:
                     status.update(label="⚠️ Pipeline ran but no data was saved.", state="error", expanded=False)
 
+    # Database display
     if st.session_state.scholarships_df is not None:
-        n = len(st.session_state.scholarships_df)
-        st.markdown(
-            f'<div style="text-align:right;padding-top:1.25rem">'
-            f'<span class="tag">🗄 {n} in DB</span></div>',
-            unsafe_allow_html=True,
+        df = st.session_state.scholarships_df
+        st.markdown("---")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Scraped", len(df))
+        c2.metric(
+            "Matching Profile",
+            len(st.session_state.matches_df) if st.session_state.matches_df is not None else "—",
+        )
+        avg_amt = pd.to_numeric(df.get("amount", pd.Series()), errors="coerce").mean()
+        c3.metric("Avg Award", f"${int(avg_amt):,}" if not pd.isna(avg_amt) else "—")
+
+        st.markdown("##### Full Database")
+        st.dataframe(
+            df,
+            use_container_width=True,
+            column_config={
+                "source_url": st.column_config.LinkColumn("Source"),
+                "amount":     st.column_config.NumberColumn("Amount ($)", format="$%d"),
+                "min_gpa":    st.column_config.NumberColumn("Min GPA", format="%.1f"),
+            },
+            hide_index=True,
         )
 
-st.divider()
-
+        if st.session_state.scout_done:
+            n_m = len(st.session_state.matches_df) if st.session_state.matches_df is not None else 0
+            st.success(
+                f"**Step 1 complete!** {len(df)} scholarships found — {n_m} match your profile. "
+                "👉 Click the **Matches** tab to review them."
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 1 — SCOUT
+# TAB 2 — MATCHES
 # ─────────────────────────────────────────────────────────────────────────────
 with tab2:
     st.markdown('<div class="tag">Step 02</div>', unsafe_allow_html=True)
     st.markdown('<div class="step-title">Your Matches</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="step-sub">Scholarships filtered to your GPA, major, and state.</div>',
+        '<div class="step-sub">Filtered to scholarships that fit your GPA, major, state, and demographics.</div>',
         unsafe_allow_html=True,
     )
 
     if st.session_state.matches_df is None:
         st.info("Run a Scout first, or fill in your profile to filter the existing database.")
     elif st.session_state.matches_df.empty:
-        st.warning("No matches for your current profile. Try broadening your major or adjusting GPA.")
+        st.warning(
+            "No matches for your current profile. Try: broadening your major, "
+            "lowering GPA threshold, or clearing the database and running a fresh Scout."
+        )
     else:
         matches = st.session_state.matches_df
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Matches Found", len(matches))
-        c2.metric("Your GPA",     f"{gpa:.1f}")
-        c3.metric("Field",         major or "—")
+        c2.metric("Your GPA",      f"{gpa:.1f}")
+        c3.metric("Field",          major or "—")
 
         st.dataframe(
             matches,
@@ -457,12 +508,13 @@ with tab2:
             data=buf.getvalue(),
             file_name="my_scholarship_matches.csv",
             mime="text/csv",
+            key="btn_dl_matches",
         )
 
         st.success(
-            f"**Step 2 complete!** You have {len(matches)} scholarship match(es). "
-            "👉 Click the **Drafts** tab above, then make sure your profile is pasted "
-            "in the sidebar, and hit **Generate All Drafts**."
+            f"**Step 2 complete!** {len(matches)} match(es) found. "
+            "👉 Click the **Drafts** tab, paste your profile in the sidebar, "
+            "and hit **Generate All Drafts**."
         )
 
 
@@ -475,7 +527,7 @@ with tab3:
     st.markdown(
         '<div class="step-sub">'
         "Reads each scholarship's live page and writes a personalized cover letter "
-        "grounded in your profile."
+        "grounded in your uploaded profile."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -505,7 +557,7 @@ with tab3:
             if user_api_key:
                 os.environ["API_KEY"] = user_api_key
             st.session_state.is_drafting = True
-            st.session_state.drafts = {}
+            st.session_state.drafts      = {}
             bar = st.progress(0, text="Starting...")
             for i, (_, row) in enumerate(matches.iterrows()):
                 bar.progress(i / len(matches), text=f"Writing: {row['name']}...")
@@ -531,11 +583,10 @@ with tab3:
                         data=essay,
                         file_name=f"Draft_{safe}.txt",
                         mime="text/plain",
-                        key=f"dl_{safe}",
+                        key=f"btn_dl_{safe}",
                     )
 
             st.success(
                 f"**Step 3 complete!** {len(st.session_state.drafts)} draft(s) ready. "
-                "Download each one above, review and personalize before submitting. "
-                "Good luck! 🎓"
+                "Review and personalize each one before submitting. Good luck! 🎓"
             )
