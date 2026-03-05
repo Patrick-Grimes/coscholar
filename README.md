@@ -1,5 +1,7 @@
 # CoScholar — Autonomous Scholarship Agent
 
+🔗 [Live Demo](https://coscholar-ai.streamlit.app)
+
 An end-to-end agentic pipeline that scouts the web for scholarships, filters them against a student profile, and drafts personalized cover letters using RAG (Retrieval-Augmented Generation).
 
 Built with Python, Gemini API, Streamlit, and BeautifulSoup.
