@@ -35,7 +35,7 @@ Built with Python, Gemini API, Streamlit, and BeautifulSoup.
 
 ```bash
 # 1. Clone and create a virtual environment
-git clone https://github.com/YOUR_USERNAME/coscholar.git
+git clone https://github.com/Patrick-Grimes/coscholar.git
 cd coscholar
 python -m venv .venv
 source .venv/bin/activate        # Mac/Linux
