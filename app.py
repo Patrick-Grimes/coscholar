@@ -290,6 +290,9 @@ with tab1:
         unsafe_allow_html=True,
     )
 
+    api_key_set   = bool(user_api_key or os.getenv("API_KEY"))
+    profile_ready = all([name.strip(), major.strip(), gpa > 0])
+
     if not api_key_set:
         st.warning("👈  Paste your Gemini API key in the sidebar to get started.")
     elif not profile_ready:
@@ -425,6 +428,9 @@ with tab1:
         'scrapes them with Gemini, and saves results to your local database.</div>',
         unsafe_allow_html=True,
     )
+
+    api_key_set   = bool(user_api_key or os.getenv("API_KEY"))
+    profile_ready = all([name.strip(), major.strip(), gpa > 0])
 
     if not api_key_set:
         st.warning("👈  Paste your Gemini API key in the sidebar to get started.")
