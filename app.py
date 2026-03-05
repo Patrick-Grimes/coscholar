@@ -217,8 +217,8 @@ with st.sidebar:
     # Applicant profile / resume
     st.markdown('<div class="slabel">Applicant Profile</div>', unsafe_allow_html=True)
     st.caption(
-        "Include anything relevant: demographics, ethnicity, income level, "
-        "first-gen status, GPA, state, projects, skills, and goals."
+        "Upload files such as resumes, cover letters, or previous applications,"
+        "and paste anything else in the text box - The more detail, the better the filtering and cover letters!"
     )
 
     # Multiple file upload
@@ -246,9 +246,7 @@ with st.sidebar:
     pasted_text = st.text_area(
         "Or paste your profile here",
         placeholder=(
-            "• Name, school, major, grad year\n"
-            "• GPA, state, ethnicity, income background\n"
-            "• First-generation student? (yes/no)\n"
+            "Paste any other relevant info here, including:\n"
             "• Key projects & technical skills\n"
             "• Extracurriculars, interests, goals"
         ),
