@@ -162,6 +162,20 @@ with st.sidebar:
     st.caption("Autonomous Scholarship Agent · Powered by Gemini")
     st.divider()
 
+    st.markdown('<div class="slabel">Gemini API Key</div>', unsafe_allow_html=True)
+    user_api_key = st.text_input(
+        "Gemini API Key",
+        type="password",
+        placeholder="Paste your key from aistudio.google.com",
+        label_visibility="collapsed",
+    )
+    if user_api_key:
+        st.success("✅ Key set for this session")
+    else:
+        st.caption("🔑 Get a free key at [aistudio.google.com](https://aistudio.google.com)")
+
+    st.divider()
+
     st.markdown('<div class="slabel">Profile</div>', unsafe_allow_html=True)
     name  = st.text_input("Full Name", placeholder="Jane Smith")
     major = st.text_input("Major / Field", placeholder="Computer Science")
@@ -276,7 +290,9 @@ with tab1:
         unsafe_allow_html=True,
     )
 
-    if not all([name.strip(), major.strip(), gpa > 0]):
+    if not api_key_set:
+        st.warning("👈  Paste your Gemini API key in the sidebar to get started.")
+    elif not profile_ready:
         st.info("👈  Fill in your Name, Major, and GPA in the sidebar to get started.")
     else:
         # Estimate runtime so user isn't surprised
@@ -316,6 +332,9 @@ with tab1:
                 angles.append("general")
 
                 st.write(f"🔎 Running **{len(angles)} searches:** {', '.join(angles)}")
+
+                if user_api_key:
+                    os.environ["API_KEY"] = user_api_key
 
                 profile = {
                     "major":        major,
@@ -407,7 +426,9 @@ with tab1:
         unsafe_allow_html=True,
     )
 
-    if not all([name.strip(), major.strip(), gpa > 0]):
+    if not api_key_set:
+        st.warning("👈  Paste your Gemini API key in the sidebar to get started.")
+    elif not profile_ready:
         st.info("👈  Fill in your Name, Major, and GPA in the sidebar to get started.")
     else:
         # Estimate runtime so user isn't surprised
@@ -428,6 +449,9 @@ with tab1:
                 angles.append("general")
 
                 st.write(f"🔎 Running **{len(angles)} searches:** {', '.join(angles)}")
+
+                if user_api_key:
+                    os.environ["API_KEY"] = user_api_key
 
                 profile = {
                     "major":        major,
@@ -596,6 +620,8 @@ with tab3:
             )
 
         if draft_clicked and not st.session_state.is_drafting:
+            if user_api_key:
+                os.environ["API_KEY"] = user_api_key
             st.session_state.is_drafting = True
             st.session_state.drafts = {}
             bar = st.progress(0, text="Starting...")
