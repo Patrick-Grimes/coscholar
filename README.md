@@ -15,7 +15,7 @@ Built with Python, Streamlit, BeautifulSoup, and your choice of AI provider.
 | **Scout** | Runs multiple targeted searches (by major, state, ethnicity, first-gen status, etc.) via DuckDuckGo and deduplicates URLs across all queries |
 | **Extract** | Fetches each page, strips JS/CSS to reduce tokens, sends clean HTML to your chosen AI for structured JSON extraction — name, amount, GPA, deadline, and eligibility fields |
 | **Filter** | Multi-axis Pandas filtering: GPA, major, state, ethnicity, first-gen, income-based. Expired scholarships are dropped automatically by deadline parsing |
-| **Draft** | Re-fetches each matched scholarship's live page and uses RAG to write a personalized cover letter grounded in your uploaded resume |
+| **Draft** | Re-fetches each matched scholarship\'s live page and uses RAG to write a personalized cover letter grounded in your uploaded resume |
 
 ---
 
@@ -39,32 +39,28 @@ CoScholar works with any of these providers. Select yours from the dropdown in t
 
 | Provider | Default Model | Get a Key |
 |---|---|---|
-| **Gemini** | gemini-flash-latest | [aistudio.google.com](https://aistudio.google.com) (free) |
-| **Claude** | claude-3-5-haiku-latest | [console.anthropic.com](https://console.anthropic.com) |
-| **OpenAI** | gpt-4o-mini | [platform.openai.com](https://platform.openai.com/api-keys) |
-| **Ollama** | llama3.2 | No key needed — runs locally via [ollama.com](https://ollama.com) |
+| **Gemini** | \gemini-flash-latest\ | [aistudio.google.com](https://aistudio.google.com) (free) |
+| **Claude** | \claude-3-5-haiku-latest\ | [console.anthropic.com](https://console.anthropic.com) |
+| **OpenAI** | \gpt-4o-mini\ | [platform.openai.com](https://platform.openai.com/api-keys) |
+| **Ollama** | \llama3.2\ | No key needed — runs locally via [ollama.com](https://ollama.com) |
 
 Paste your key into the API key field in the sidebar. It is used only for that session and is never stored or written to disk.
 
-**For local development**, you can also set keys in a \\.env\\ file instead of entering them in the sidebar:
+**For local development**, you can also set keys in a \.env\ file instead of entering them in the sidebar:
 
-\\\`n
-GEMINI_API_KEY=your_key_here
-
+\GEMINI_API_KEY=your_key_here
 ANTHROPIC_API_KEY=your_key_here
-
 OPENAI_API_KEY=your_key_here
+\
+The sidebar key always takes priority over \.env\ values.
 
-\\\`n
-The sidebar key always takes priority over \\.env\\ values.
-
-> **Note:** Never commit your \\.env\\ file. It is gitignored by default.
+> **Note:** Never commit your \.env\ file. It is gitignored by default.
 
 ---
 
 ## Setup
 
-\\\ash
+\\ash
 # 1. Clone and create a virtual environment
 git clone https://github.com/Patrick-Grimes/coscholar.git
 cd coscholar
@@ -77,12 +73,12 @@ pip install -r requirements.txt
 
 # 3. Run
 streamlit run app.py
-\\\`n
+\
 ---
 
 ## Project Structure
 
-\\\`ncoscholar/
+\coscholar/
 ├── .streamlit/
 │   └── config.toml      # Dark theme config
 ├── app.py               # Streamlit UI + filtering logic
@@ -92,7 +88,7 @@ streamlit run app.py
 ├── ai_scraper.py        # AI-based structured extraction + schema validation
 ├── drafter.py           # RAG cover letter generation
 └── requirements.txt
-\\\`n
+\
 ---
 
 ## Security
@@ -108,6 +104,6 @@ streamlit run app.py
 ## Notes
 
 - Works best on static HTML pages. JavaScript-heavy SPAs (React/Angular) return limited results.
-- The scholarship database persists as \\scholarship_database.csv\\ locally and auto-loads on browser refresh.
-- AI calls use exponential backoff retry (via \\	enacity\\) to handle rate limits gracefully.
-- Filtering logic lives in \\pp.py\\ (\\ilter_matches()\\). It runs on scout completion and reactively as you update your profile in the sidebar.
+- The scholarship database persists as \scholarship_database.csv\ locally and auto-loads on browser refresh.
+- AI calls use exponential backoff retry (via \	enacity\) to handle rate limits gracefully.
+- Filtering logic lives in \pp.py\ (\ilter_matches()\). It runs on scout completion and reactively as you update your profile in the sidebar.
