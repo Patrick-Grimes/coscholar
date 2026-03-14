@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import os
 import datetime
+import html
+import pdfplumber
+import io
 from io import StringIO
 
 from agent import find_scholarship_urls
@@ -197,11 +200,11 @@ with st.sidebar:
 
     # Profile
     st.markdown('<div class="slabel">Profile</div>', unsafe_allow_html=True)
-    name         = st.text_input("Full Name",         placeholder="Jane Smith")
-    major        = st.text_input("Major / Field",     placeholder="Computer Science")
+    name         = st.text_input("Full Name",         placeholder="Jane Smith", max_chars=100)
+    major        = st.text_input("Major / Field",     placeholder="Computer Science", max_chars=100)
     gpa          = st.number_input("GPA", min_value=0.0, max_value=4.0, step=0.1, format="%.1f")
     state        = st.text_input("State (2-letter)",  placeholder="NC", max_chars=2).upper()
-    ethnicity    = st.text_input("Ethnicity (optional)", placeholder="e.g. Hispanic, Black, Asian, white")
+    ethnicity    = st.text_input("Ethnicity (optional)", placeholder="e.g. Hispanic, Black, Asian, white", max_chars=50)
     first_gen    = st.checkbox("First-generation college student")
     income_based = st.checkbox("Financial need / income-based")
 
@@ -229,16 +232,41 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
+    MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+    PDF_MAGIC = b"%PDF"
+
+    if "uploaded_file_cache" not in st.session_state:
+        st.session_state.uploaded_file_cache = {}
+
     uploaded_text = ""
     for f in uploaded_files:
+        cache_key = f"{f.name}_{f.size}"
+
+        if cache_key in st.session_state.uploaded_file_cache:
+            uploaded_text += st.session_state.uploaded_file_cache[cache_key] + "\n\n"
+            st.success(f"✅ {f.name}")
+            continue
+
+        if f.size > MAX_FILE_SIZE:
+            st.warning(f"⚠️ {f.name} exceeds 5 MB limit — skipped.")
+            continue
+
+        raw_bytes = f.read()
+
         if f.type == "text/plain":
-            uploaded_text += f.read().decode("utf-8", errors="ignore") + "\n\n"
+            text = raw_bytes.decode("utf-8", errors="ignore")
+            st.session_state.uploaded_file_cache[cache_key] = text
+            uploaded_text += text + "\n\n"
             st.success(f"✅ {f.name}")
         elif f.type == "application/pdf":
+            if not raw_bytes[:4].startswith(PDF_MAGIC):
+                st.warning(f"⚠️ {f.name} doesn't appear to be a valid PDF — skipped.")
+                continue
             try:
-                import pdfplumber, io
-                with pdfplumber.open(io.BytesIO(f.read())) as pdf:
-                    uploaded_text += "\n".join(p.extract_text() or "" for p in pdf.pages) + "\n\n"
+                with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                    text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+                st.session_state.uploaded_file_cache[cache_key] = text
+                uploaded_text += text + "\n\n"
                 st.success(f"✅ {f.name}")
             except Exception as e:
                 st.warning(f"PDF parse error ({f.name}): {e}")
@@ -251,6 +279,7 @@ with st.sidebar:
             "• Extracurriculars, interests, goals"
         ),
         height=180,
+        max_chars=10000,
         label_visibility="collapsed",
     )
 
@@ -263,7 +292,7 @@ with st.sidebar:
     st.divider()
     if os.path.exists(DB_PATH):
         ts    = datetime.datetime.fromtimestamp(os.path.getmtime(DB_PATH)).strftime("%b %d · %I:%M %p")
-        count = len(pd.read_csv(DB_PATH))
+        count = len(st.session_state.scholarships_df) if st.session_state.scholarships_df is not None else len(pd.read_csv(DB_PATH))
         st.markdown(
             f'<div class="status-loaded">📂 Database loaded<br>'
             f'<span style="opacity:0.7">{count} scholarships · {ts}</span></div>',
@@ -297,6 +326,10 @@ with pill_col:
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
+active_api_key = user_api_key or os.getenv("API_KEY") or ""
+api_key_set    = bool(active_api_key)
+profile_ready  = all([name.strip(), major.strip(), gpa > 0])
+
 tab1, tab2, tab3 = st.tabs(["  🔍  Scout  ", "  📋  Matches  ", "  ✏️  Drafts  "])
 
 
@@ -311,9 +344,6 @@ with tab1:
         'scrapes each page with Gemini, and saves results to your local database.</div>',
         unsafe_allow_html=True,
     )
-
-    api_key_set   = bool(user_api_key or os.getenv("API_KEY"))
-    profile_ready = all([name.strip(), major.strip(), gpa > 0])
 
     if not api_key_set:
         st.warning("👈  Paste your Gemini API key in the sidebar to get started.")
@@ -360,9 +390,6 @@ with tab1:
 
                 st.write(f"🔎 Running **{len(angles)} searches:** {', '.join(angles)}")
 
-                if user_api_key:
-                    os.environ["API_KEY"] = user_api_key
-
                 profile = {
                     "major":        major,
                     "state":        state,
@@ -371,20 +398,23 @@ with tab1:
                     "income_based": income_based,
                 }
 
+                urls = None
                 try:
                     urls = find_scholarship_urls(profile, max_results=max_results)
                 except Exception as e:
                     st.session_state.is_scouting = False
                     status.update(label=f"❌ Search failed: {e}", state="error", expanded=False)
-                    st.stop()
 
-                if not urls:
+                if urls is not None and not urls:
                     st.session_state.is_scouting = False
                     status.update(
                         label="⚠️ No URLs found. Try increasing URLs to Scout in the sidebar.",
                         state="error", expanded=False,
                     )
-                    st.stop()
+                    urls = None
+
+                if not urls:
+                    st.rerun()
 
                 st.write(f"📡 Found **{len(urls)} unique URLs**. Scraping with Gemini...")
 
@@ -404,7 +434,7 @@ with tab1:
                             f"**{found_so_far} scholarships** found so far"
                         )
 
-                run_scholarship_pipeline(urls, progress_callback=ui_callback)
+                run_scholarship_pipeline(urls, progress_callback=ui_callback, api_key=active_api_key)
                 st.session_state.is_scouting = False
 
                 if os.path.exists(DB_PATH):
@@ -533,7 +563,9 @@ with tab3:
     no_matches = st.session_state.matches_df is None or st.session_state.matches_df.empty
     no_resume  = not resume_text.strip()
 
-    if no_matches:
+    if not api_key_set:
+        st.warning("👈  Paste your Gemini API key in the sidebar to generate drafts.")
+    elif no_matches:
         st.info("Complete Step 1 first so there are matches to draft for.")
     elif no_resume:
         st.warning("👈  Paste your profile or upload a resume in the sidebar before drafting.")
@@ -552,15 +584,13 @@ with tab3:
             )
 
         if draft_clicked and not st.session_state.is_drafting:
-            if user_api_key:
-                os.environ["API_KEY"] = user_api_key
             st.session_state.is_drafting = True
             st.session_state.drafts      = {}
             bar = st.progress(0, text="Starting...")
             for i, (_, row) in enumerate(matches.iterrows()):
                 bar.progress(i / len(matches), text=f"Writing: {row['name']}...")
                 try:
-                    st.session_state.drafts[row["name"]] = draft_application(row, resume_text)
+                    st.session_state.drafts[row["name"]] = draft_application(row, resume_text, api_key=active_api_key)
                 except Exception as e:
                     st.session_state.drafts[row["name"]] = f"Error generating draft: {e}"
             bar.progress(1.0, text="All drafts complete!")
@@ -570,9 +600,9 @@ with tab3:
             st.markdown("---")
             st.markdown(f"##### {len(st.session_state.drafts)} Draft(s) Ready")
             for scholarship_name, essay in st.session_state.drafts.items():
-                with st.expander(f"📄  {scholarship_name}"):
+                with st.expander(f"📄  {html.escape(scholarship_name)}"):
                     st.markdown(
-                        f'<div class="draft-body">{essay}</div>',
+                        f'<div class="draft-body">{html.escape(essay)}</div>',
                         unsafe_allow_html=True,
                     )
                     safe = "".join(x for x in scholarship_name if x.isalnum())
