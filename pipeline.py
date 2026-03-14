@@ -4,8 +4,52 @@ import pandas as pd
 import json
 import time
 import datetime
+import ipaddress
+from urllib.parse import urlparse
+import socket
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from ai_scraper import extract_scholarship_data
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+def _extract_with_retry(html_content, api_key=None):
+    return extract_scholarship_data(html_content, api_key=api_key)
+
+
+def _is_safe_url(url: str) -> bool:
+    """Block private/internal IPs, non-HTTP schemes, and localhost."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return False
+
+    blocked = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"}
+    if hostname.lower() in blocked:
+        return False
+
+    try:
+        resolved = socket.getaddrinfo(hostname, None)
+        for _, _, _, _, sockaddr in resolved:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return False
+    except (socket.gaierror, ValueError):
+        return False
+
+    return True
 
 
 def fetch_and_clean_html(url):
@@ -13,6 +57,10 @@ def fetch_and_clean_html(url):
     Downloads a webpage and strips scripts, styles, and junk
     to save tokens when sending to Gemini.
     """
+    if not _is_safe_url(url):
+        print(f"Blocked unsafe URL: {url}")
+        return None
+
     print(f"Fetching: {url}...")
 
     headers = {
@@ -20,7 +68,7 @@ def fetch_and_clean_html(url):
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=(5, 10))
+        response = requests.get(url, headers=headers, timeout=(5, 10), allow_redirects=False)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -69,7 +117,7 @@ def is_scholarship_active(scholarship: dict) -> bool:
     return True
 
 
-def run_scholarship_pipeline(urls: list, progress_callback=None) -> int:
+def run_scholarship_pipeline(urls: list, progress_callback=None, api_key: str = None) -> int:
     """
     Fetches each URL, extracts scholarships via Gemini, filters out inactive
     ones, and saves results to scholarship_database.csv.
@@ -102,10 +150,10 @@ def run_scholarship_pipeline(urls: list, progress_callback=None) -> int:
             continue
 
         print("  -> Sending to Gemini...")
-        time.sleep(3)
+        time.sleep(1)
 
         try:
-            data       = extract_scholarship_data(html_content)
+            data       = _extract_with_retry(html_content, api_key=api_key)
             found_list = data.get("scholarships", [])
 
             active   = 0

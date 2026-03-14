@@ -1,5 +1,4 @@
 from ddgs import DDGS
-from pipeline import run_scholarship_pipeline
 
 
 def build_queries(profile: dict) -> list[str]:
@@ -70,6 +69,8 @@ def find_scholarship_urls(profile: dict, max_results: int = 5) -> list[str]:
 
 
 if __name__ == "__main__":
+    from pipeline import run_scholarship_pipeline
+
     test_profile = {
         "major":        "data science",
         "state":        "NC",
