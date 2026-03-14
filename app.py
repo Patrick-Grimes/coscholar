@@ -180,21 +180,46 @@ if st.session_state.scholarships_df is None and os.path.exists(DB_PATH):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🎓 CoScholar")
-    st.caption("Autonomous Scholarship Agent · Powered by Gemini")
+    st.caption("Autonomous Scholarship Agent · Bring Your Own AI Key")
     st.divider()
 
-    # API Key
-    st.markdown('<div class="slabel">Gemini API Key</div>', unsafe_allow_html=True)
-    user_api_key = st.text_input(
-        "Gemini API Key",
-        type="password",
-        placeholder="Paste your key from aistudio.google.com",
+    # Provider + API key
+    st.markdown('<div class="slabel">AI Provider</div>', unsafe_allow_html=True)
+    provider = st.selectbox(
+        "AI Provider",
+        ["Gemini", "Claude", "OpenAI", "Ollama"],
         label_visibility="collapsed",
     )
-    if user_api_key:
-        st.success("✅ Key set for this session")
+
+    _KEY_HINTS = {
+        "Gemini": ("Paste your key from aistudio.google.com", "🔑 Get a free key at [aistudio.google.com](https://aistudio.google.com)"),
+        "Claude": ("Paste your key from console.anthropic.com", "🔑 Get a key at [console.anthropic.com](https://console.anthropic.com)"),
+        "OpenAI": ("Paste your key from platform.openai.com", "🔑 Get a key at [platform.openai.com](https://platform.openai.com/api-keys)"),
+    }
+
+    if provider == "Ollama":
+        st.markdown('<div class="slabel">Ollama Host URL</div>', unsafe_allow_html=True)
+        ollama_host = st.text_input(
+            "Ollama Host",
+            placeholder="http://localhost:11434",
+            label_visibility="collapsed",
+        )
+        user_api_key = None
+        st.caption("Ollama runs locally — no API key needed. [Get Ollama](https://ollama.com)")
     else:
-        st.caption("🔑 Get a free key at [aistudio.google.com](https://aistudio.google.com)")
+        ollama_host = None
+        placeholder, hint = _KEY_HINTS[provider]
+        st.markdown(f'<div class="slabel">{provider} API Key</div>', unsafe_allow_html=True)
+        user_api_key = st.text_input(
+            f"{provider} API Key",
+            type="password",
+            placeholder=placeholder,
+            label_visibility="collapsed",
+        )
+        if user_api_key:
+            st.success("✅ Key set for this session")
+        else:
+            st.caption(hint)
 
     st.divider()
 
@@ -326,8 +351,14 @@ with pill_col:
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-active_api_key = user_api_key or os.getenv("API_KEY") or ""
-api_key_set    = bool(active_api_key)
+_ENV_KEYS = {
+    "Gemini": os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY") or "",
+    "Claude": os.getenv("ANTHROPIC_API_KEY") or "",
+    "OpenAI": os.getenv("OPENAI_API_KEY") or "",
+    "Ollama": "",
+}
+active_api_key = user_api_key or _ENV_KEYS.get(provider, "") or ""
+api_key_set    = (provider == "Ollama") or bool(active_api_key)
 profile_ready  = all([name.strip(), major.strip(), gpa > 0])
 
 tab1, tab2, tab3 = st.tabs(["  🔍  Scout  ", "  📋  Matches  ", "  ✏️  Drafts  "])
@@ -341,12 +372,12 @@ with tab1:
     st.markdown('<div class="step-title">Scout Scholarships</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="step-sub">Searches the web across multiple eligibility dimensions, '
-        'scrapes each page with Gemini, and saves results to your local database.</div>',
+        'scrapes each page with AI, and saves results to your local database.</div>',
         unsafe_allow_html=True,
     )
 
     if not api_key_set:
-        st.warning("👈  Paste your Gemini API key in the sidebar to get started.")
+        st.warning(f"👈  Paste your {provider} API key in the sidebar to get started.")
     elif not profile_ready:
         if st.session_state.scholarships_df is not None:
             st.info(
@@ -416,7 +447,7 @@ with tab1:
                 if not urls:
                     st.rerun()
 
-                st.write(f"📡 Found **{len(urls)} unique URLs**. Scraping with Gemini...")
+                st.write(f"📡 Found **{len(urls)} unique URLs**. Scraping with {provider}...")
 
                 counter_box  = st.empty()
                 progress_bar = st.progress(0)
@@ -434,7 +465,7 @@ with tab1:
                             f"**{found_so_far} scholarships** found so far"
                         )
 
-                run_scholarship_pipeline(urls, progress_callback=ui_callback, api_key=active_api_key)
+                run_scholarship_pipeline(urls, progress_callback=ui_callback, provider=provider, api_key=active_api_key, ollama_host=ollama_host)
                 st.session_state.is_scouting = False
 
                 if os.path.exists(DB_PATH):
@@ -564,7 +595,7 @@ with tab3:
     no_resume  = not resume_text.strip()
 
     if not api_key_set:
-        st.warning("👈  Paste your Gemini API key in the sidebar to generate drafts.")
+        st.warning(f"👈  Paste your {provider} API key in the sidebar to generate drafts.")
     elif no_matches:
         st.info("Complete Step 1 first so there are matches to draft for.")
     elif no_resume:
@@ -590,7 +621,7 @@ with tab3:
             for i, (_, row) in enumerate(matches.iterrows()):
                 bar.progress(i / len(matches), text=f"Writing: {row['name']}...")
                 try:
-                    st.session_state.drafts[row["name"]] = draft_application(row, resume_text, api_key=active_api_key)
+                    st.session_state.drafts[row["name"]] = draft_application(row, resume_text, provider=provider, api_key=active_api_key, ollama_host=ollama_host)
                 except Exception as e:
                     st.session_state.drafts[row["name"]] = f"Error generating draft: {e}"
             bar.progress(1.0, text="All drafts complete!")

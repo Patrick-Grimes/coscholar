@@ -1,14 +1,13 @@
 import pandas as pd
-import os
 from dotenv import load_dotenv
 
 from pipeline import fetch_and_clean_html
-from ai_scraper import get_client
+from llm import call_llm
 
 load_dotenv()
 
 
-def draft_application(scholarship_row, resume: str, api_key: str = None):
+def draft_application(scholarship_row, resume: str, provider: str = "Gemini", api_key: str = None, ollama_host: str = None):
     """
     Drafts a personalized cover letter for a scholarship.
 
@@ -60,12 +59,7 @@ def draft_application(scholarship_row, resume: str, api_key: str = None):
     )
 
     try:
-        client = get_client(api_key)
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt
-        )
-        return response.text
+        return call_llm(prompt, provider=provider, api_key=api_key, ollama_host=ollama_host)
     except Exception as e:
         return f"Error drafting application: {e}"
 

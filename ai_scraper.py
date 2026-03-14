@@ -1,21 +1,9 @@
-import os
-from google import genai
-from dotenv import load_dotenv
 import json
+from dotenv import load_dotenv
+
+from llm import call_llm
 
 load_dotenv()
-
-
-def get_client(api_key: str = None) -> genai.Client:
-    """Create a Gemini client on demand with the provided or env-based key."""
-    key = api_key or os.getenv("API_KEY")
-    if not key:
-        raise ValueError(
-            "No API key provided. Set API_KEY in .env or enter one in the sidebar."
-        )
-    if not key.startswith("AIza"):
-        raise ValueError("Invalid Gemini API key format.")
-    return genai.Client(api_key=key)
 
 messy_html_example = """
 <div class="funding-box">
@@ -49,9 +37,7 @@ def _validate_scholarship(item: dict) -> bool:
     return True
 
 
-def extract_scholarship_data(html_snippet, api_key: str = None):
-    client = get_client(api_key)
-
+def extract_scholarship_data(html_snippet, provider: str = "Gemini", api_key: str = None, ollama_host: str = None):
     prompt = (
         "You are a data extraction robot. "
         "Extract ALL scholarship opportunities from the HTML below.\n\n"
@@ -95,12 +81,8 @@ def extract_scholarship_data(html_snippet, api_key: str = None):
     )
 
     try:
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt
-        )
-
-        clean_json_text = response.text.replace("```json", "").replace("```", "").strip()
+        raw = call_llm(prompt, provider=provider, api_key=api_key, ollama_host=ollama_host)
+        clean_json_text = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_json_text)
 
         if not isinstance(data, dict) or "scholarships" not in data:
@@ -115,10 +97,7 @@ def extract_scholarship_data(html_snippet, api_key: str = None):
 
 if __name__ == "__main__":
     print("STARTING")
-    data = extract_scholarship_data(messy_html_example)
+    data = extract_scholarship_data(messy_html_example, provider="Gemini")
 
     print("\n--- EXTRACTED DATA ---")
     print(json.dumps(data, indent=2))
-
-    if data.get('amount', 0) > 5000:
-        print(f"\n[System] High Value Alert! Found a ${data.get('amount')} scholarship.")

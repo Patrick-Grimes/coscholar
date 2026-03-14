@@ -18,8 +18,8 @@ from ai_scraper import extract_scholarship_data
     retry=retry_if_exception_type(Exception),
     reraise=True,
 )
-def _extract_with_retry(html_content, api_key=None):
-    return extract_scholarship_data(html_content, api_key=api_key)
+def _extract_with_retry(html_content, provider="Gemini", api_key=None, ollama_host=None):
+    return extract_scholarship_data(html_content, provider=provider, api_key=api_key, ollama_host=ollama_host)
 
 
 def _is_safe_url(url: str) -> bool:
@@ -117,7 +117,7 @@ def is_scholarship_active(scholarship: dict) -> bool:
     return True
 
 
-def run_scholarship_pipeline(urls: list, progress_callback=None, api_key: str = None) -> int:
+def run_scholarship_pipeline(urls: list, progress_callback=None, provider: str = "Gemini", api_key: str = None, ollama_host: str = None) -> int:
     """
     Fetches each URL, extracts scholarships via Gemini, filters out inactive
     ones, and saves results to scholarship_database.csv.
@@ -153,7 +153,7 @@ def run_scholarship_pipeline(urls: list, progress_callback=None, api_key: str = 
         time.sleep(1)
 
         try:
-            data       = _extract_with_retry(html_content, api_key=api_key)
+            data       = _extract_with_retry(html_content, provider=provider, api_key=api_key, ollama_host=ollama_host)
             found_list = data.get("scholarships", [])
 
             active   = 0
