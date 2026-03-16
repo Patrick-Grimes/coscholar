@@ -1,4 +1,4 @@
-# CoScholar — Autonomous Scholarship & Internship Agent
+# CoScholar - Autonomous Scholarship & Internship Agent
 
 🔗 [Live Demo](https://coscholar-ai.streamlit.app)
 
