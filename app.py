@@ -85,6 +85,14 @@ MAJOR_ALIASES = {
     "math":             ["math", "mathematics", "statistics", "stats"],
 }
 
+US_STATES = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+]
+
 def major_terms(major: str) -> list[str]:
     m = major.lower().strip()
     for key, aliases in MAJOR_ALIASES.items():
@@ -107,7 +115,7 @@ def filter_scholarship_matches(
     df: pd.DataFrame,
     major: str,
     gpa: float,
-    state: str,
+    states: list[str],
     ethnicity: str = "",
     first_gen: bool = False,
     income_based: bool = False,
@@ -123,10 +131,15 @@ def filter_scholarship_matches(
     major_mask = _is_open(major_col) | major_match
 
     state_col = _col(df, "eligible_states")
-    state_mask = (
-        _is_open(state_col) |
-        state_col.str.contains(state, case=False, regex=False)
-    ) if state else pd.Series([True] * len(df))
+    if states:
+        state_mask = _is_open(state_col)
+        for s in states:
+            s_clean = (s or "").strip()
+            if not s_clean:
+                continue
+            state_mask = state_mask | state_col.str.contains(s_clean, case=False, regex=False)
+    else:
+        state_mask = pd.Series([True] * len(df))
 
     eth_col = _col(df, "ethnicity")
     if ethnicity:
@@ -154,6 +167,7 @@ def filter_internship_matches(
     df: pd.DataFrame,
     major: str,
     gpa: float,
+    states: list[str],
     location_pref: str = "Any",
     class_year: str = "",
 ) -> pd.DataFrame:
@@ -168,11 +182,21 @@ def filter_internship_matches(
         major_match = major_match | major_col.str.contains(term, case=False, regex=False)
     major_mask = _is_open(major_col) | major_match
 
+    loc_col = _col(df, "location")
     if location_pref and location_pref != "Any":
-        loc_col = _col(df, "location")
-        location_mask = loc_col.str.contains(location_pref, case=False, regex=False)
+        location_pref_mask = loc_col.str.contains(location_pref, case=False, regex=False)
     else:
-        location_mask = pd.Series([True] * len(df))
+        location_pref_mask = pd.Series([True] * len(df))
+
+    if states:
+        state_location_mask = pd.Series([False] * len(df))
+        for s in states:
+            s_clean = (s or "").strip()
+            if not s_clean:
+                continue
+            state_location_mask = state_location_mask | loc_col.str.contains(s_clean, case=False, regex=False)
+    else:
+        state_location_mask = pd.Series([True] * len(df))
 
     if class_year:
         cy_col = _col(df, "class_year")
@@ -180,7 +204,7 @@ def filter_internship_matches(
     else:
         class_year_mask = pd.Series([True] * len(df))
 
-    mask = gpa_mask & major_mask & location_mask & class_year_mask
+    mask = gpa_mask & major_mask & location_pref_mask & state_location_mask & class_year_mask
     return df[mask].copy()
 
 
@@ -274,7 +298,9 @@ with st.sidebar:
     name  = st.text_input("Full Name", placeholder="Jane Smith", max_chars=100)
     major = st.text_input("Major / Field", placeholder="Computer Science", max_chars=100)
     gpa   = st.number_input("GPA", min_value=0.0, max_value=4.0, step=0.1, format="%.1f")
-    state = st.text_input("State (2-letter)", placeholder="NC", max_chars=2).upper()
+    states = st.multiselect("States (2-letter)", options=US_STATES, default=[], placeholder="Select one or more states")
+    states = [s.upper() for s in states]
+    primary_state = states[0] if states else ""
 
     if mode_key == "scholarship":
         ethnicity    = st.text_input("Ethnicity (optional)", placeholder="e.g. Hispanic, Black, Asian, white", max_chars=50)
@@ -299,12 +325,12 @@ with st.sidebar:
     if st.session_state.listings_df is not None and major.strip() and gpa > 0:
         if mode_key == "scholarship":
             st.session_state.matches_df = filter_scholarship_matches(
-                st.session_state.listings_df, major, gpa, state,
+                st.session_state.listings_df, major, gpa, states,
                 ethnicity, first_gen, income_based,
             )
         else:
             st.session_state.matches_df = filter_internship_matches(
-                st.session_state.listings_df, major, gpa,
+                st.session_state.listings_df, major, gpa, states,
                 location_pref, class_year,
             )
 
@@ -469,9 +495,9 @@ with tab1:
             st.info("👈  Fill in your Name, Major, and GPA in the sidebar to get started.")
     else:
         if mode_key == "scholarship":
-            angles_preview = sum([bool(major), bool(state), bool(ethnicity), first_gen, income_based, True])
+            angles_preview = sum([bool(major), bool(states), bool(ethnicity), first_gen, income_based, True])
         else:
-            angles_preview = sum([bool(desired_role), bool(major), bool(state), location_pref == "Remote", bool(class_year), True])
+            angles_preview = sum([bool(desired_role), bool(major), bool(states), location_pref == "Remote", bool(class_year), True])
         est_min = max(1, round((angles_preview * max_results * 4) / 60))
         st.caption(
             f"⏱ Estimated time: **{est_min}–{est_min + 1} min** "
@@ -495,31 +521,40 @@ with tab1:
 
         if st.session_state.is_scouting:
             with st.status("Scouting the web — this may take a few minutes...", expanded=True) as status:
+                state_label = ", ".join(states)
                 if mode_key == "scholarship":
                     angles = []
                     if major:        angles.append(f"major ({major})")
-                    if state:        angles.append(f"state ({state})")
+                    if state_label:  angles.append(f"states ({state_label})")
                     if ethnicity:    angles.append(f"ethnicity ({ethnicity})")
                     if first_gen:    angles.append("first-generation")
                     if income_based: angles.append("need-based")
                     angles.append("general")
 
                     profile = {
-                        "major": major, "state": state, "ethnicity": ethnicity,
-                        "first_gen": first_gen, "income_based": income_based,
+                        "major": major,
+                        "state": primary_state,
+                        "states": states,
+                        "ethnicity": ethnicity,
+                        "first_gen": first_gen,
+                        "income_based": income_based,
                     }
                 else:
                     angles = []
                     if desired_role: angles.append(f"role ({desired_role})")
                     if major:        angles.append(f"major ({major})")
-                    if state:        angles.append(f"state ({state})")
+                    if state_label:  angles.append(f"states ({state_label})")
                     if location_pref == "Remote": angles.append("remote")
                     if class_year:   angles.append(f"class year ({class_year})")
                     angles.append("general")
 
                     profile = {
-                        "major": major, "state": state, "desired_role": desired_role,
-                        "location_pref": location_pref, "class_year": class_year,
+                        "major": major,
+                        "state": primary_state,
+                        "states": states,
+                        "desired_role": desired_role,
+                        "location_pref": location_pref,
+                        "class_year": class_year,
                     }
 
                 st.write(f"🔎 Running **{len(angles)} searches:** {', '.join(angles)}")
@@ -571,9 +606,9 @@ with tab1:
                     load_csv.clear()
                     df = load_csv(DB_PATH)
                     if mode_key == "scholarship":
-                        matches = filter_scholarship_matches(df, major, gpa, state, ethnicity, first_gen, income_based)
+                        matches = filter_scholarship_matches(df, major, gpa, states, ethnicity, first_gen, income_based)
                     else:
-                        matches = filter_internship_matches(df, major, gpa, location_pref, class_year)
+                        matches = filter_internship_matches(df, major, gpa, states, location_pref, class_year)
                     st.session_state.listings_df = df
                     st.session_state.matches_df  = matches
                     st.session_state.scout_done  = True
@@ -594,6 +629,10 @@ with tab1:
     # Database display
     if st.session_state.listings_df is not None:
         df = st.session_state.listings_df
+        if mode_key == "internship" and "paid" in df.columns:
+            df_display = df.drop(columns=["paid"])
+        else:
+            df_display = df
         st.markdown("---")
 
         c1, c2, c3 = st.columns(3)
@@ -625,7 +664,7 @@ with tab1:
                 "min_gpa":    st.column_config.NumberColumn("Min GPA", format="%.1f"),
             }
 
-        st.dataframe(df, use_container_width=True, column_config=col_config, hide_index=True)
+        st.dataframe(df_display, use_container_width=True, column_config=col_config, hide_index=True)
 
         if st.session_state.scout_done:
             n_m = len(st.session_state.matches_df) if st.session_state.matches_df is not None else 0
@@ -662,6 +701,10 @@ with tab2:
         )
     else:
         matches = st.session_state.matches_df
+        if mode_key == "internship" and "paid" in matches.columns:
+            matches_display = matches.drop(columns=["paid"])
+        else:
+            matches_display = matches
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Matches Found", len(matches))
@@ -680,7 +723,7 @@ with tab2:
                 "min_gpa":    st.column_config.NumberColumn("Min GPA", format="%.1f"),
             }
 
-        st.dataframe(matches, use_container_width=True, column_config=col_config, hide_index=True)
+        st.dataframe(matches_display, use_container_width=True, column_config=col_config, hide_index=True)
 
         buf = StringIO()
         matches.to_csv(buf, index=False)
