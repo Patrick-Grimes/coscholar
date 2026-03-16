@@ -413,6 +413,7 @@ title_col, pill_col = st.columns([5, 1])
 with title_col:
     st.markdown(f"# {_TITLES[mode]}")
     st.caption(_SUBTITLES[mode])
+    st.caption("Switch between Scholarship and Internship mode in the sidebar.")
 with pill_col:
     if st.session_state.listings_df is not None:
         n = len(st.session_state.listings_df)
