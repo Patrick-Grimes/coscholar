@@ -11,11 +11,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from ai_scraper import extract_scholarship_data, extract_internship_data
 
-DB_PATHS = {
-    "scholarship": "scholarship_database.csv",
-    "internship":  "internship_database.csv",
-}
-
 _EXTRACT_FNS = {
     "scholarship": extract_scholarship_data,
     "internship":  extract_internship_data,
@@ -138,20 +133,19 @@ def run_pipeline(
     provider: str = "Gemini",
     api_key: str = None,
     ollama_host: str = None,
-) -> int:
+) -> pd.DataFrame:
     """
     Fetches each URL, extracts listings via LLM, filters out inactive
-    ones, and saves results to the appropriate CSV.
+    ones, and returns the results as a DataFrame (in-memory only).
 
     Args:
         urls:              List of URLs to scrape.
         mode:              "scholarship" or "internship".
         progress_callback: Optional callable invoked after each URL is processed.
     Returns:
-        Number of listings saved.
+        A pandas DataFrame of active listings (may be empty).
     """
     data_key = _DATA_KEYS[mode]
-    csv_path = DB_PATHS[mode]
     all_items = []
     total = len(urls)
 
@@ -204,12 +198,11 @@ def run_pipeline(
     if all_items:
         df = pd.DataFrame(all_items)
         df = df.fillna("")
-        df.to_csv(csv_path, index=False)
-        print(f"\n--- Database Updated: {len(df)} active {mode}s ---")
-        return len(df)
-    else:
-        print(f"\nNo active {mode}s found.")
-        return 0
+        print(f"\n--- Session Results: {len(df)} active {mode}s ---")
+        return df
+
+    print(f"\nNo active {mode}s found.")
+    return pd.DataFrame()
 
 
 # Backward-compatible alias

@@ -226,6 +226,7 @@ for key, default in [
 with st.sidebar:
     st.markdown("## 🎓 CoScholar")
     st.caption("Autonomous Scholarship & Internship Agent")
+    st.caption("Results are stored only for this browser session.")
     st.divider()
 
     # Mode toggle
@@ -248,7 +249,6 @@ with st.sidebar:
 
     mode = st.session_state.mode
     mode_key = mode.lower()  # "scholarship" or "internship"
-    DB_PATH = DB_PATHS[mode_key]
     mode_noun = "scholarships" if mode_key == "scholarship" else "internships"
 
     st.divider()
@@ -316,10 +316,6 @@ with st.sidebar:
         desired_role  = st.text_input("Desired Role / Title", placeholder="Software Engineering Intern", max_chars=100)
         location_pref = st.selectbox("Location Preference", ["Any", "Remote", "Hybrid", "On-site"])
         class_year    = st.selectbox("Class Year", ["", "Freshman", "Sophomore", "Junior", "Senior"])
-
-    # Load existing DB on first run
-    if st.session_state.listings_df is None and os.path.exists(DB_PATH):
-        st.session_state.listings_df = load_csv(DB_PATH)
 
     # Auto-filter on profile change
     if st.session_state.listings_df is not None and major.strip() and gpa > 0:
@@ -406,25 +402,24 @@ with st.sidebar:
     st.markdown('<div class="slabel">Search Settings</div>', unsafe_allow_html=True)
     max_results = st.slider("URLs to Scout", 1, 10, 3)
 
-    # DB status
+    # Session status
     st.divider()
-    if os.path.exists(DB_PATH):
-        ts    = datetime.datetime.fromtimestamp(os.path.getmtime(DB_PATH)).strftime("%b %d · %I:%M %p")
-        count = len(st.session_state.listings_df) if st.session_state.listings_df is not None else len(pd.read_csv(DB_PATH))
+    if st.session_state.listings_df is not None:
+        count = len(st.session_state.listings_df)
         st.markdown(
-            f'<div class="status-loaded">📂 Database loaded<br>'
-            f'<span style="opacity:0.7">{count} {mode_noun} · {ts}</span></div>',
+            f'<div class="status-loaded">📂 Session results<br>'
+            f'<span style="opacity:0.7">{count} {mode_noun} in this browser session</span></div>',
             unsafe_allow_html=True,
         )
-        if st.button("🗑  Clear Database", use_container_width=True, key="btn_clear_db"):
-            os.remove(DB_PATH)
+        if st.button("🔁 Reset Session Data", use_container_width=True, key="btn_reset_session"):
             st.session_state.listings_df = None
             st.session_state.matches_df  = None
             st.session_state.drafts      = {}
+            st.session_state.scout_done  = False
             load_csv.clear()
             st.rerun()
     else:
-        st.caption(f"No {mode_noun} database yet. Run a Scout to build one.")
+        st.caption(f"No {mode_noun} yet. Run a Scout to build results for this session.")
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -598,17 +593,22 @@ with tab1:
                             f"**{found_so_far} {mode_noun}** found so far"
                         )
 
-                run_pipeline(urls, mode=mode_key, progress_callback=ui_callback,
-                             provider=provider, api_key=active_api_key, ollama_host=ollama_host)
+                df = run_pipeline(
+                    urls,
+                    mode=mode_key,
+                    progress_callback=ui_callback,
+                    provider=provider,
+                    api_key=active_api_key,
+                    ollama_host=ollama_host,
+                )
                 st.session_state.is_scouting = False
 
-                if os.path.exists(DB_PATH):
-                    load_csv.clear()
-                    df = load_csv(DB_PATH)
+                if df is not None and not df.empty:
                     if mode_key == "scholarship":
                         matches = filter_scholarship_matches(df, major, gpa, states, ethnicity, first_gen, income_based)
                     else:
                         matches = filter_internship_matches(df, major, gpa, states, location_pref, class_year)
+
                     st.session_state.listings_df = df
                     st.session_state.matches_df  = matches
                     st.session_state.scout_done  = True
@@ -624,7 +624,11 @@ with tab1:
                             state="complete", expanded=False,
                         )
                 else:
-                    status.update(label="⚠️ Pipeline ran but no data was saved.", state="error", expanded=False)
+                    status.update(
+                        label=f"⚠️ No active {mode_noun} found. Try different search terms.",
+                        state="error",
+                        expanded=False,
+                    )
 
     # Database display
     if st.session_state.listings_df is not None:
@@ -665,6 +669,18 @@ with tab1:
             }
 
         st.dataframe(df_display, use_container_width=True, column_config=col_config, hide_index=True)
+
+        # Per-session full database download
+        db_buf = StringIO()
+        df.to_csv(db_buf, index=False)
+        db_filename = "scholarship_database_session.csv" if mode_key == "scholarship" else "internship_database_session.csv"
+        st.download_button(
+            "⬇️  Download Full Database CSV",
+            data=db_buf.getvalue(),
+            file_name=db_filename,
+            mime="text/csv",
+            key="btn_dl_full_db",
+        )
 
         if st.session_state.scout_done:
             n_m = len(st.session_state.matches_df) if st.session_state.matches_df is not None else 0
