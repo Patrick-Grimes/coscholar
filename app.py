@@ -183,11 +183,13 @@ def filter_internship_matches(
     major_mask = _is_open(major_col) | major_match
 
     loc_col = _col(df, "location")
+    # Location preference mask (e.g. Remote / Hybrid / On-site)
     if location_pref and location_pref != "Any":
         location_pref_mask = loc_col.str.contains(location_pref, case=False, regex=False)
     else:
         location_pref_mask = pd.Series([True] * len(df))
 
+    # State-based location mask (e.g. CA, NY). Uses OR across selected states.
     if states:
         state_location_mask = pd.Series([False] * len(df))
         for s in states:
@@ -198,13 +200,21 @@ def filter_internship_matches(
     else:
         state_location_mask = pd.Series([True] * len(df))
 
+    # Combine location preference and state filters:
+    # - If only one is set, it acts alone.
+    # - If both are set, we accept rows that match EITHER (logical OR).
+    if (location_pref and location_pref != "Any") and states:
+        location_mask = location_pref_mask | state_location_mask
+    else:
+        location_mask = location_pref_mask & state_location_mask
+
     if class_year:
         cy_col = _col(df, "class_year")
         class_year_mask = _is_open(cy_col) | cy_col.str.contains(class_year, case=False, regex=False)
     else:
         class_year_mask = pd.Series([True] * len(df))
 
-    mask = gpa_mask & major_mask & location_pref_mask & state_location_mask & class_year_mask
+    mask = gpa_mask & major_mask & location_mask & class_year_mask
     return df[mask].copy()
 
 
