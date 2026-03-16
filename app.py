@@ -8,7 +8,7 @@ import io
 from io import StringIO
 
 from agent import find_scholarship_urls, find_internship_urls
-from pipeline import run_pipeline, DB_PATHS
+from pipeline import run_pipeline
 from drafter import draft_application
 from dotenv import load_dotenv
 
