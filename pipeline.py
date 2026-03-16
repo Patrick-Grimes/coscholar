@@ -9,7 +9,22 @@ from urllib.parse import urlparse
 import socket
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from ai_scraper import extract_scholarship_data
+from ai_scraper import extract_scholarship_data, extract_internship_data
+
+DB_PATHS = {
+    "scholarship": "scholarship_database.csv",
+    "internship":  "internship_database.csv",
+}
+
+_EXTRACT_FNS = {
+    "scholarship": extract_scholarship_data,
+    "internship":  extract_internship_data,
+}
+
+_DATA_KEYS = {
+    "scholarship": "scholarships",
+    "internship":  "internships",
+}
 
 
 @retry(
@@ -18,8 +33,9 @@ from ai_scraper import extract_scholarship_data
     retry=retry_if_exception_type(Exception),
     reraise=True,
 )
-def _extract_with_retry(html_content, provider="Gemini", api_key=None, ollama_host=None):
-    return extract_scholarship_data(html_content, provider=provider, api_key=api_key, ollama_host=ollama_host)
+def _extract_with_retry(html_content, mode="scholarship", provider="Gemini", api_key=None, ollama_host=None):
+    fn = _EXTRACT_FNS[mode]
+    return fn(html_content, provider=provider, api_key=api_key, ollama_host=ollama_host)
 
 
 def _is_safe_url(url: str) -> bool:
@@ -55,7 +71,7 @@ def _is_safe_url(url: str) -> bool:
 def fetch_and_clean_html(url):
     """
     Downloads a webpage and strips scripts, styles, and junk
-    to save tokens when sending to Gemini.
+    to save tokens when sending to the LLM.
     """
     if not _is_safe_url(url):
         print(f"Blocked unsafe URL: {url}")
@@ -84,13 +100,13 @@ def fetch_and_clean_html(url):
         return None
 
 
-def is_scholarship_active(scholarship: dict) -> bool:
+def is_listing_active(item: dict) -> bool:
     """
     Best-effort check: returns False only if we can clearly tell
-    the scholarship deadline has already passed.
-    When in doubt, returns True (keeps the scholarship).
+    the listing's deadline has already passed.
+    When in doubt, returns True (keeps the listing).
     """
-    deadline = str(scholarship.get("deadline", "")).strip().lower()
+    deadline = str(item.get("deadline", "")).strip().lower()
 
     if not deadline or deadline in ("", "nan", "none", "rolling", "varies"):
         return True
@@ -98,12 +114,10 @@ def is_scholarship_active(scholarship: dict) -> bool:
     current_year  = datetime.datetime.now().year
     current_month = datetime.datetime.now().month
 
-    # Past year explicitly mentioned
     for year in range(2020, current_year):
         if str(year) in deadline:
             return False
 
-    # Current year + past month
     month_map = {
         "jan": 1, "feb": 2, "mar": 3, "apr": 4,  "may": 5,  "jun": 6,
         "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
@@ -117,21 +131,28 @@ def is_scholarship_active(scholarship: dict) -> bool:
     return True
 
 
-def run_scholarship_pipeline(urls: list, progress_callback=None, provider: str = "Gemini", api_key: str = None, ollama_host: str = None) -> int:
+def run_pipeline(
+    urls: list,
+    mode: str = "scholarship",
+    progress_callback=None,
+    provider: str = "Gemini",
+    api_key: str = None,
+    ollama_host: str = None,
+) -> int:
     """
-    Fetches each URL, extracts scholarships via Gemini, filters out inactive
-    ones, and saves results to scholarship_database.csv.
+    Fetches each URL, extracts listings via LLM, filters out inactive
+    ones, and saves results to the appropriate CSV.
 
     Args:
         urls:              List of URLs to scrape.
+        mode:              "scholarship" or "internship".
         progress_callback: Optional callable invoked after each URL is processed.
-                           Signature: callback(url, site_num, total_sites,
-                                               found_so_far, done=False)
-                           Used by app.py to update the UI in real time.
     Returns:
-        Number of scholarships saved.
+        Number of listings saved.
     """
-    all_scholarships = []
+    data_key = _DATA_KEYS[mode]
+    csv_path = DB_PATHS[mode]
+    all_items = []
     total = len(urls)
 
     for i, url in enumerate(urls):
@@ -140,7 +161,7 @@ def run_scholarship_pipeline(urls: list, progress_callback=None, provider: str =
                 url=url,
                 site_num=i + 1,
                 total_sites=total,
-                found_so_far=len(all_scholarships),
+                found_so_far=len(all_items),
             )
 
         html_content = fetch_and_clean_html(url)
@@ -149,19 +170,19 @@ def run_scholarship_pipeline(urls: list, progress_callback=None, provider: str =
             print(f"  -> Skipping {url} (fetch failed)")
             continue
 
-        print("  -> Sending to Gemini...")
+        print(f"  -> Sending to {provider}...")
         time.sleep(1)
 
         try:
-            data       = _extract_with_retry(html_content, provider=provider, api_key=api_key, ollama_host=ollama_host)
-            found_list = data.get("scholarships", [])
+            data       = _extract_with_retry(html_content, mode=mode, provider=provider, api_key=api_key, ollama_host=ollama_host)
+            found_list = data.get(data_key, [])
 
             active   = 0
             inactive = 0
             for item in found_list:
                 item["source_url"] = url
-                if is_scholarship_active(item):
-                    all_scholarships.append(item)
+                if is_listing_active(item):
+                    all_items.append(item)
                     active += 1
                 else:
                     inactive += 1
@@ -171,29 +192,34 @@ def run_scholarship_pipeline(urls: list, progress_callback=None, provider: str =
         except Exception as e:
             print(f"  -> Error processing {url}: {e}")
 
-    # Final callback so the UI shows the completed state
     if progress_callback and urls:
         progress_callback(
             url=urls[-1],
             site_num=total,
             total_sites=total,
-            found_so_far=len(all_scholarships),
+            found_so_far=len(all_items),
             done=True,
         )
 
-    if all_scholarships:
-        df = pd.DataFrame(all_scholarships)
+    if all_items:
+        df = pd.DataFrame(all_items)
         df = df.fillna("")
-        df.to_csv("scholarship_database.csv", index=False)
-        print(f"\n--- Database Updated: {len(df)} active scholarships ---")
+        df.to_csv(csv_path, index=False)
+        print(f"\n--- Database Updated: {len(df)} active {mode}s ---")
         return len(df)
     else:
-        print("\nNo active scholarships found.")
+        print(f"\nNo active {mode}s found.")
         return 0
+
+
+# Backward-compatible alias
+def run_scholarship_pipeline(urls, progress_callback=None, provider="Gemini", api_key=None, ollama_host=None):
+    return run_pipeline(urls, mode="scholarship", progress_callback=progress_callback,
+                        provider=provider, api_key=api_key, ollama_host=ollama_host)
 
 
 if __name__ == "__main__":
     target_urls = [
         "https://www.careeronestop.org/Toolkit/Training/find-scholarships.aspx?keyword=data%20science&sortcolumns=BestMatch&sortdirections=Descending&p=1",
     ]
-    run_scholarship_pipeline(target_urls)
+    run_pipeline(target_urls, mode="scholarship")

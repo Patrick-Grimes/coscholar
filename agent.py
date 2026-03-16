@@ -1,6 +1,8 @@
 from ddgs import DDGS
 
 
+# ── Scholarship queries ──────────────────────────────────────────────────────
+
 def build_queries(profile: dict) -> list[str]:
     """
     Turns a student profile into a list of targeted DDG search queries.
@@ -15,38 +17,67 @@ def build_queries(profile: dict) -> list[str]:
     first_gen = profile.get("first_gen", False)
     income    = profile.get("income_based", False)
 
-    # Major-specific (most targeted)
     if major:
         queries.append(f"{major} scholarships 2026 apply")
 
-    # State-based (huge category, often overlooked)
     if state:
         queries.append(f"{state} state scholarships undergraduate 2026")
 
-    # Demographic / identity
     if ethnicity and ethnicity.lower() not in ("", "prefer not to say"):
         queries.append(f"{ethnicity} student scholarships 2026 apply")
 
-    # First-gen
     if first_gen:
         queries.append("first generation college student scholarships 2026")
 
-    # Need-based
     if income:
         queries.append("need based undergraduate scholarships 2026 apply")
 
-    # Broad catch-all — finds scholarships with no major restriction
     queries.append("undergraduate scholarships 2026 no major restriction apply")
 
     return queries
 
 
-def find_scholarship_urls(profile: dict, max_results: int = 5) -> list[str]:
+# ── Internship queries ───────────────────────────────────────────────────────
+
+def build_internship_queries(profile: dict) -> list[str]:
     """
-    Runs multiple DDG searches based on the student's full profile
-    and returns a deduplicated list of URLs.
+    Turns a student profile into targeted DDG search queries for internships.
     """
-    queries = build_queries(profile)
+    queries = []
+
+    major       = profile.get("major", "").strip()
+    state       = profile.get("state", "").strip()
+    desired_role = profile.get("desired_role", "").strip()
+    location_pref = profile.get("location_pref", "Any").strip()
+    class_year  = profile.get("class_year", "").strip()
+
+    if desired_role:
+        queries.append(f"{desired_role} internship summer 2026 apply")
+
+    if major:
+        queries.append(f"{major} internship 2026 undergraduate")
+
+    if desired_role and major and desired_role.lower() != major.lower():
+        queries.append(f"{major} {desired_role} internship 2026")
+
+    if state:
+        queries.append(f"internships in {state} undergraduate 2026")
+
+    if location_pref.lower() == "remote":
+        queries.append(f"remote internship {major or desired_role or 'undergraduate'} 2026")
+
+    if class_year:
+        queries.append(f"{class_year} student internship 2026 apply")
+
+    queries.append("undergraduate internships summer 2026 apply")
+
+    return queries
+
+
+# ── Shared search runner ─────────────────────────────────────────────────────
+
+def _run_search(queries: list[str], max_results: int) -> list[str]:
+    """Runs DDG searches for a list of queries, returns deduplicated URLs."""
     print(f"Running {len(queries)} search queries based on profile...")
 
     seen = set()
@@ -68,8 +99,16 @@ def find_scholarship_urls(profile: dict, max_results: int = 5) -> list[str]:
     return urls
 
 
+def find_scholarship_urls(profile: dict, max_results: int = 5) -> list[str]:
+    return _run_search(build_queries(profile), max_results)
+
+
+def find_internship_urls(profile: dict, max_results: int = 5) -> list[str]:
+    return _run_search(build_internship_queries(profile), max_results)
+
+
 if __name__ == "__main__":
-    from pipeline import run_scholarship_pipeline
+    from pipeline import run_pipeline
 
     test_profile = {
         "major":        "data science",
@@ -80,4 +119,4 @@ if __name__ == "__main__":
     }
     found_urls = find_scholarship_urls(test_profile, max_results=3)
     print(f"\nPassing {len(found_urls)} URLs to pipeline...\n")
-    run_scholarship_pipeline(found_urls)
+    run_pipeline(found_urls, mode="scholarship")
