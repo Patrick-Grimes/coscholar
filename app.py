@@ -23,7 +23,8 @@ st.set_page_config(
 )
 
 # ── Mode helpers ──────────────────────────────────────────────────────────────
-MODES = ["Scholarship", "Internship", "Job"]
+# Career modes first — Scholarship remains available as a third target.
+MODES = ["Job", "Internship", "Scholarship"]
 MODE_KEYS = {"Scholarship": "scholarship", "Internship": "internship", "Job": "job"}
 MODE_NOUNS = {"scholarship": "scholarships", "internship": "internships", "job": "jobs"}
 MODE_ICONS = {"Scholarship": "🎓", "Internship": "💼", "Job": "🏢"}
@@ -33,9 +34,14 @@ MODE_TITLES = {
     "Job":         "CoJobs **AI**",
 }
 MODE_SUBTITLES = {
-    "Scholarship": "Discovery → Filtering → Drafting, end-to-end.",
-    "Internship":  "Scout → Match → Draft, end-to-end.",
-    "Job":         "Scout → Match → Draft, end-to-end.",
+    "Scholarship": "Profile → Find scholarships → Draft letters.",
+    "Internship":  "Profile → Find internships → Draft cover letters.",
+    "Job":         "Profile → Find jobs → Draft cover letters.",
+}
+DEFAULT_MODE = "Job"
+ROLE_STOPWORDS = {
+    "the", "a", "an", "and", "or", "for", "of", "to", "in", "at", "on",
+    "intern", "internship", "job", "jobs", "role", "position", "associate",
 }
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -113,18 +119,168 @@ def major_terms(major: str) -> list[str]:
     m = major.lower().strip()
     for key, aliases in MAJOR_ALIASES.items():
         if m in aliases or m == key:
-            return aliases
-    terms = [m]
-    if " " in m:
-        terms.append(m.split()[0])
-    return terms
+            # Prefer longer aliases first to reduce short-token false hits.
+            return sorted(set(aliases + [key]), key=len, reverse=True)
+    return [m] if m else []
+
+
+def role_terms(desired_role: str) -> list[str]:
+    import re
+    tokens = re.findall(r"[a-z0-9]+", (desired_role or "").lower())
+    return [t for t in tokens if t not in ROLE_STOPWORDS and len(t) > 1]
 
 
 def _col(df, name):
     return df.get(name, pd.Series([""] * len(df))).astype(str).str.strip()
 
-def _is_open(series):
-    return series.isin(["", "[]", "nan", "None", "none"])
+
+def _is_unknown(series: pd.Series) -> pd.Series:
+    """Empty / missing eligibility — unknown, not unrestricted."""
+    s = series.fillna("").astype(str).str.strip()
+    return s.isin(["", "[]", "nan", "None", "none", "null", "NaN"])
+
+
+def _is_explicit_all(series: pd.Series) -> pd.Series:
+    """Page explicitly said unrestricted (extractor uses ALL / nationwide markers)."""
+    s = series.fillna("").astype(str).str.lower()
+    return (
+        s.str.contains(r"\ball\b", regex=True)
+        | s.str.contains("nationwide", regex=False)
+        | s.str.contains("any major", regex=False)
+        | s.str.contains("open to all", regex=False)
+    )
+
+
+def _field_match_mask(series: pd.Series, terms: list[str], *, allow_unknown: bool = True) -> tuple[pd.Series, pd.Series]:
+    """
+    Returns (hard_mask, explicit_match_mask).
+    Unknown fields soft-pass when allow_unknown; explicit ALL always passes;
+    otherwise require a term hit. Explicit mismatches are dropped.
+    """
+    unknown = _is_unknown(series)
+    explicit_all = _is_explicit_all(series)
+    hit = pd.Series([False] * len(series), index=series.index)
+    for term in terms:
+        if not term:
+            continue
+        hit = hit | series.str.contains(term, case=False, regex=False)
+    if allow_unknown:
+        # Soft-pass unknowns; drop known mismatches (content present, not ALL, no hit).
+        hard = unknown | explicit_all | hit
+    else:
+        hard = explicit_all | hit
+    return hard, hit
+
+
+def _location_mask(loc_col: pd.Series, location_pref: str, states: list[str]) -> pd.Series:
+    """
+    Location preference + states.
+    On-site = not Remote/Hybrid and has a location.
+    When both pref and states are set, require AND (e.g. Remote in those states).
+    """
+    lower = loc_col.str.lower()
+    is_remote = lower.str.contains("remote", regex=False)
+    is_hybrid = lower.str.contains("hybrid", regex=False)
+    unknown = _is_unknown(loc_col)
+
+    pref = (location_pref or "Any").strip()
+    if pref == "Remote":
+        pref_mask = is_remote | unknown
+    elif pref == "Hybrid":
+        pref_mask = is_hybrid | unknown
+    elif pref == "On-site":
+        pref_mask = (~is_remote & ~is_hybrid & ~unknown) | unknown
+        # Prefer concrete places when known; unknown soft-passes but ranks lower later.
+    else:
+        pref_mask = pd.Series([True] * len(loc_col), index=loc_col.index)
+
+    if states:
+        state_mask = pd.Series([False] * len(loc_col), index=loc_col.index)
+        for s in states:
+            s_clean = (s or "").strip()
+            if not s_clean:
+                continue
+            # Word-ish match for 2-letter codes to reduce "AL" in "California".
+            if len(s_clean) == 2:
+                state_mask = state_mask | loc_col.str.contains(
+                    rf"(?:^|[^A-Za-z]){s_clean}(?:[^A-Za-z]|$)", case=False, regex=True
+                )
+            else:
+                state_mask = state_mask | loc_col.str.contains(s_clean, case=False, regex=False)
+        # Remote nationwide listings often omit a state — allow unknown/pure-remote
+        # only when preference is Remote and no concrete conflicting state is required.
+        if pref == "Remote":
+            state_mask = state_mask | (is_remote & unknown) | (lower.isin(["remote", "remote, usa", "remote - usa"]))
+        if pref and pref != "Any":
+            return pref_mask & (state_mask | unknown)
+        return state_mask | unknown
+
+    return pref_mask
+
+
+def _gpa_mask(df: pd.DataFrame, gpa: float) -> pd.Series:
+    gpa_col = pd.to_numeric(df.get("min_gpa", pd.Series(index=df.index)), errors="coerce")
+    # Missing requirement → pass; explicit requirement must be <= user GPA.
+    return gpa_col.isna() | (gpa_col <= gpa)
+
+
+def _role_mask(df: pd.DataFrame, desired_role: str) -> tuple[pd.Series, pd.Series]:
+    if not (desired_role or "").strip():
+        true = pd.Series([True] * len(df), index=df.index)
+        false = pd.Series([False] * len(df), index=df.index)
+        return true, false
+    role_col = _col(df, "role")
+    terms = role_terms(desired_role)
+    if not terms:
+        true = pd.Series([True] * len(df), index=df.index)
+        false = pd.Series([False] * len(df), index=df.index)
+        return true, false
+    return _field_match_mask(role_col, terms, allow_unknown=True)
+
+
+def _score_matches(
+    df: pd.DataFrame,
+    *,
+    mode: str,
+    major: str,
+    desired_role: str = "",
+) -> pd.DataFrame:
+    """Rank matches: explicit field hits beat unknowns; prefer apply_url + description."""
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    scores = pd.Series([0.0] * len(out), index=out.index)
+
+    major_col = _col(out, "majors" if mode == "scholarship" else "preferred_majors")
+    terms = major_terms(major)
+    _, major_hit = _field_match_mask(major_col, terms, allow_unknown=True)
+    scores = scores + major_hit.astype(float) * 3.0
+    scores = scores + _is_explicit_all(major_col).astype(float) * 1.0
+    # Penalize unknown majors slightly so explicit matches float up.
+    scores = scores - _is_unknown(major_col).astype(float) * 1.5
+
+    if mode in ("internship", "job") and desired_role.strip():
+        _, role_hit = _role_mask(out, desired_role)
+        scores = scores + role_hit.astype(float) * 5.0
+        scores = scores - _is_unknown(_col(out, "role")).astype(float) * 1.0
+
+    apply_col = _col(out, "apply_url")
+    scores = scores + (~_is_unknown(apply_col) & apply_col.str.startswith("http")).astype(float) * 2.0
+
+    desc_col = _col(out, "description")
+    scores = scores + (~_is_unknown(desc_col)).astype(float) * 1.0
+
+    gpa_col = pd.to_numeric(out.get("min_gpa", pd.Series(index=out.index)), errors="coerce")
+    scores = scores + gpa_col.fillna(0).clip(lower=0, upper=4) * 0.1
+
+    if mode == "scholarship" and "amount" in out.columns:
+        amt = pd.to_numeric(out["amount"], errors="coerce").fillna(0)
+        scores = scores + (amt.clip(upper=50000) / 10000.0)
+
+    out["match_score"] = scores
+    out = out.sort_values("match_score", ascending=False)
+    return out
 
 
 def filter_scholarship_matches(
@@ -136,47 +292,54 @@ def filter_scholarship_matches(
     first_gen: bool = False,
     income_based: bool = False,
 ) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df.copy() if df is not None else pd.DataFrame()
 
-    gpa_mask = df["min_gpa"] <= gpa
+    gpa_mask = _gpa_mask(df, gpa)
 
     major_col = _col(df, "majors")
-    terms = major_terms(major)
-    major_match = pd.Series([False] * len(df))
-    for term in terms:
-        major_match = major_match | major_col.str.contains(term, case=False, regex=False)
-    major_mask = _is_open(major_col) | major_match
+    major_mask, _ = _field_match_mask(major_col, major_terms(major), allow_unknown=True)
 
     state_col = _col(df, "eligible_states")
     if states:
-        state_mask = _is_open(state_col)
+        state_mask = _is_unknown(state_col) | _is_explicit_all(state_col)
         for s in states:
             s_clean = (s or "").strip()
             if not s_clean:
                 continue
-            state_mask = state_mask | state_col.str.contains(s_clean, case=False, regex=False)
+            if len(s_clean) == 2:
+                state_mask = state_mask | state_col.str.contains(
+                    rf"(?:^|[^A-Za-z]){s_clean}(?:[^A-Za-z]|$)", case=False, regex=True
+                )
+            else:
+                state_mask = state_mask | state_col.str.contains(s_clean, case=False, regex=False)
     else:
-        state_mask = pd.Series([True] * len(df))
+        state_mask = pd.Series([True] * len(df), index=df.index)
 
     eth_col = _col(df, "ethnicity")
     if ethnicity:
-        eth_mask = _is_open(eth_col) | eth_col.str.contains(ethnicity, case=False, regex=False)
+        eth_mask = (
+            _is_unknown(eth_col)
+            | _is_explicit_all(eth_col)
+            | eth_col.str.contains(ethnicity, case=False, regex=False)
+        )
     else:
-        eth_mask = pd.Series([True] * len(df))
+        eth_mask = pd.Series([True] * len(df), index=df.index)
 
     fg_col = _col(df, "first_gen")
     first_gen_mask = (
-        ~fg_col.str.lower().isin(["true", "1"]) |
-        pd.Series([first_gen] * len(df))
+        ~fg_col.str.lower().isin(["true", "1"])
+        | pd.Series([first_gen] * len(df), index=df.index)
     )
 
     inc_col = _col(df, "income_based")
     income_mask = (
-        ~inc_col.str.lower().isin(["true", "1"]) |
-        pd.Series([income_based] * len(df))
+        ~inc_col.str.lower().isin(["true", "1"])
+        | pd.Series([income_based] * len(df), index=df.index)
     )
 
     mask = gpa_mask & major_mask & state_mask & eth_mask & first_gen_mask & income_mask
-    return df[mask].copy()
+    return _score_matches(df[mask], mode="scholarship", major=major)
 
 
 def filter_internship_matches(
@@ -186,52 +349,28 @@ def filter_internship_matches(
     states: list[str],
     location_pref: str = "Any",
     class_year: str = "",
+    desired_role: str = "",
 ) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df.copy() if df is not None else pd.DataFrame()
 
-    gpa_col = pd.to_numeric(df.get("min_gpa", pd.Series()), errors="coerce").fillna(0.0)
-    gpa_mask = gpa_col <= gpa
+    gpa_mask = _gpa_mask(df, gpa)
 
     major_col = _col(df, "preferred_majors")
-    terms = major_terms(major)
-    major_match = pd.Series([False] * len(df))
-    for term in terms:
-        major_match = major_match | major_col.str.contains(term, case=False, regex=False)
-    major_mask = _is_open(major_col) | major_match
+    major_mask, _ = _field_match_mask(major_col, major_terms(major), allow_unknown=True)
 
-    loc_col = _col(df, "location")
-    # Location preference mask (e.g. Remote / Hybrid / On-site)
-    if location_pref and location_pref != "Any":
-        location_pref_mask = loc_col.str.contains(location_pref, case=False, regex=False)
-    else:
-        location_pref_mask = pd.Series([True] * len(df))
-
-    # State-based location mask (e.g. CA, NY). Uses OR across selected states.
-    if states:
-        state_location_mask = pd.Series([False] * len(df))
-        for s in states:
-            s_clean = (s or "").strip()
-            if not s_clean:
-                continue
-            state_location_mask = state_location_mask | loc_col.str.contains(s_clean, case=False, regex=False)
-    else:
-        state_location_mask = pd.Series([True] * len(df))
-
-    # Combine location preference and state filters:
-    # - If only one is set, it acts alone.
-    # - If both are set, we accept rows that match EITHER (logical OR).
-    if (location_pref and location_pref != "Any") and states:
-        location_mask = location_pref_mask | state_location_mask
-    else:
-        location_mask = location_pref_mask & state_location_mask
+    location_mask = _location_mask(_col(df, "location"), location_pref, states)
 
     if class_year:
         cy_col = _col(df, "class_year")
-        class_year_mask = _is_open(cy_col) | cy_col.str.contains(class_year, case=False, regex=False)
+        class_year_mask, _ = _field_match_mask(cy_col, [class_year], allow_unknown=True)
     else:
-        class_year_mask = pd.Series([True] * len(df))
+        class_year_mask = pd.Series([True] * len(df), index=df.index)
 
-    mask = gpa_mask & major_mask & location_mask & class_year_mask
-    return df[mask].copy()
+    role_mask, _ = _role_mask(df, desired_role)
+
+    mask = gpa_mask & major_mask & location_mask & class_year_mask & role_mask
+    return _score_matches(df[mask], mode="internship", major=major, desired_role=desired_role)
 
 
 def filter_job_matches(
@@ -241,52 +380,33 @@ def filter_job_matches(
     states: list[str],
     location_pref: str = "Any",
     experience_level: str = "",
+    desired_role: str = "",
 ) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df.copy() if df is not None else pd.DataFrame()
 
-    gpa_col = pd.to_numeric(df.get("min_gpa", pd.Series()), errors="coerce").fillna(0.0)
-    gpa_mask = gpa_col <= gpa
+    gpa_mask = _gpa_mask(df, gpa)
 
     major_col = _col(df, "preferred_majors")
-    terms = major_terms(major)
-    major_match = pd.Series([False] * len(df))
-    for term in terms:
-        major_match = major_match | major_col.str.contains(term, case=False, regex=False)
-    major_mask = _is_open(major_col) | major_match
+    major_mask, _ = _field_match_mask(major_col, major_terms(major), allow_unknown=True)
 
-    loc_col = _col(df, "location")
-    if location_pref and location_pref != "Any":
-        location_pref_mask = loc_col.str.contains(location_pref, case=False, regex=False)
-    else:
-        location_pref_mask = pd.Series([True] * len(df))
-
-    if states:
-        state_location_mask = pd.Series([False] * len(df))
-        for s in states:
-            s_clean = (s or "").strip()
-            if not s_clean:
-                continue
-            state_location_mask = state_location_mask | loc_col.str.contains(s_clean, case=False, regex=False)
-    else:
-        state_location_mask = pd.Series([True] * len(df))
-
-    if (location_pref and location_pref != "Any") and states:
-        location_mask = location_pref_mask | state_location_mask
-    else:
-        location_mask = location_pref_mask & state_location_mask
+    location_mask = _location_mask(_col(df, "location"), location_pref, states)
 
     if experience_level:
         exp_col = _col(df, "experience_level")
-        experience_mask = _is_open(exp_col) | exp_col.str.contains(experience_level, case=False, regex=False)
+        experience_mask, _ = _field_match_mask(exp_col, [experience_level], allow_unknown=True)
     else:
-        experience_mask = pd.Series([True] * len(df))
+        experience_mask = pd.Series([True] * len(df), index=df.index)
 
-    mask = gpa_mask & major_mask & location_mask & experience_mask
-    return df[mask].copy()
+    role_mask, _ = _role_mask(df, desired_role)
+
+    mask = gpa_mask & major_mask & location_mask & experience_mask & role_mask
+    return _score_matches(df[mask], mode="job", major=major, desired_role=desired_role)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
 for key, default in [
-    ("mode",            "Scholarship"),
+    ("mode",            DEFAULT_MODE),
     ("listings_df",     None),
     ("matches_df",      None),
     ("drafts",          {}),
@@ -296,24 +416,28 @@ for key, default in [
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+    # Migrate older sessions that defaulted to Scholarship-only product copy.
+    if key == "mode" and st.session_state[key] not in MODES:
+        st.session_state[key] = DEFAULT_MODE
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🎓 CoScholar")
-    st.caption("Autonomous Scholarship, Internship & Job Agent")
-    st.caption("Results are stored only for this browser session.")
+    st.markdown("## CoScholar")
+    st.caption("Find a job or internship → match your profile → draft a cover letter.")
+    st.caption("Results stay in this browser session only.")
     st.divider()
 
-    # Mode toggle
-    st.markdown('<div class="slabel">Looking for</div>', unsafe_allow_html=True)
+    # Mode toggle — Jobs & Internships first; Scholarship still available.
+    st.markdown('<div class="slabel">I want</div>', unsafe_allow_html=True)
     mode_index = MODES.index(st.session_state.mode) if st.session_state.mode in MODES else 0
     new_mode = st.radio(
-        "Looking for",
+        "I want",
         MODES,
         index=mode_index,
         horizontal=True,
         label_visibility="collapsed",
+        help="Jobs and Internships share the career pipeline. Scholarship keeps the funding flow.",
     )
     if new_mode != st.session_state.mode:
         st.session_state.mode = new_mode
@@ -371,10 +495,12 @@ with st.sidebar:
     st.divider()
 
     # ── Profile (mode-dependent) ─────────────────────────────────────────────
-    st.markdown('<div class="slabel">Profile</div>', unsafe_allow_html=True)
-    name  = st.text_input("Full Name", placeholder="Jane Smith", max_chars=100)
+    st.markdown('<div class="slabel">Your profile</div>', unsafe_allow_html=True)
+    name  = st.text_input("Full Name", placeholder="Jane Smith", max_chars=100,
+                          help="Used in cover-letter sign-off. Optional for search.")
     major = st.text_input("Major / Field", placeholder="Computer Science", max_chars=100)
-    gpa   = st.number_input("GPA", min_value=0.0, max_value=4.0, step=0.1, format="%.1f")
+    gpa   = st.number_input("GPA", min_value=0.0, max_value=5.0, step=0.1, format="%.1f",
+                            help="Supports 4.0 and 5.0 scales.")
     states = st.multiselect("States (2-letter)", options=US_STATES, default=[], placeholder="Select one or more states")
     states = [s.upper() for s in states]
     primary_state = states[0] if states else ""
@@ -393,7 +519,11 @@ with st.sidebar:
         income_based = False
         experience_level = ""
         desired_role  = st.text_input("Desired Role / Title", placeholder="Software Engineering Intern", max_chars=100)
-        location_pref = st.selectbox("Location Preference", ["Any", "Remote", "Hybrid", "On-site"])
+        location_pref = st.selectbox(
+            "Location Preference",
+            ["Any", "Remote", "Hybrid", "On-site"],
+            help="On-site means not Remote/Hybrid. Remote + states requires both.",
+        )
         class_year    = st.selectbox("Class Year", ["", "Freshman", "Sophomore", "Junior", "Senior"])
     else:  # job
         ethnicity = ""
@@ -401,7 +531,11 @@ with st.sidebar:
         income_based = False
         class_year = ""
         desired_role  = st.text_input("Desired Role / Title", placeholder="Software Engineer", max_chars=100)
-        location_pref = st.selectbox("Location Preference", ["Any", "Remote", "Hybrid", "On-site"])
+        location_pref = st.selectbox(
+            "Location Preference",
+            ["Any", "Remote", "Hybrid", "On-site"],
+            help="On-site means not Remote/Hybrid. Remote + states requires both.",
+        )
         experience_level = st.selectbox(
             "Experience Level",
             ["", "Entry-level", "New Grad", "Mid-level", "Senior"],
@@ -417,12 +551,12 @@ with st.sidebar:
         elif mode_key == "internship":
             st.session_state.matches_df = filter_internship_matches(
                 st.session_state.listings_df, major, gpa, states,
-                location_pref, class_year,
+                location_pref, class_year, desired_role=desired_role,
             )
         else:
             st.session_state.matches_df = filter_job_matches(
                 st.session_state.listings_df, major, gpa, states,
-                location_pref, experience_level,
+                location_pref, experience_level, desired_role=desired_role,
             )
 
     st.divider()
@@ -494,8 +628,12 @@ with st.sidebar:
 
     resume_text = "\n\n".join(filter(None, [uploaded_text.strip(), pasted_text.strip()]))
 
-    st.markdown('<div class="slabel">Search Settings</div>', unsafe_allow_html=True)
-    max_results = st.slider("URLs to Scout", 1, 10, 3)
+    st.markdown('<div class="slabel">Search settings</div>', unsafe_allow_html=True)
+    max_results = st.slider(
+        "Results per search angle",
+        1, 10, 3,
+        help="Each profile angle runs its own search. Total URLs are capped around 24.",
+    )
 
     # Session status
     st.divider()
@@ -522,7 +660,7 @@ title_col, pill_col = st.columns([5, 1])
 with title_col:
     st.markdown(f"# {MODE_TITLES[mode]}")
     st.caption(MODE_SUBTITLES[mode])
-    st.caption("Choose Scholarship, Internship, or Job in the sidebar.")
+    st.caption("① Profile → ② Scout matches → ③ Draft cover letters")
 with pill_col:
     if st.session_state.listings_df is not None:
         n = len(st.session_state.listings_df)
@@ -543,11 +681,24 @@ _ENV_KEYS = {
 }
 active_api_key = user_api_key or _ENV_KEYS.get(provider, "") or ""
 api_key_set    = (provider == "Ollama") or bool(active_api_key)
-profile_ready  = all([name.strip(), major.strip(), gpa > 0])
+# Name is for drafts/sign-off — not required to scout.
+profile_ready  = bool(major.strip()) and gpa > 0
+if mode_key in ("internship", "job"):
+    profile_ready = profile_ready  # desired_role optional but improves ranking
 
 # The name column used to identify a listing in drafts/display
 _name_col = "name" if mode_key == "scholarship" else "company"
 _is_career_mode = mode_key in ("internship", "job")
+draft_profile = {
+    "major": major,
+    "gpa": gpa,
+    "states": states,
+    "desired_role": desired_role,
+    "location_pref": location_pref,
+    "class_year": class_year,
+    "experience_level": experience_level,
+    "ethnicity": ethnicity,
+}
 
 tab1, tab2, tab3 = st.tabs(["  🔍  Scout  ", "  📋  Matches  ", "  ✏️  Drafts  "])
 
@@ -572,11 +723,11 @@ with tab1:
     elif not profile_ready:
         if st.session_state.listings_df is not None:
             st.info(
-                f"📂 **{len(st.session_state.listings_df)} {mode_noun} already in your database.** "
-                "👈 Fill in your Name, Major, and GPA in the sidebar — matches will populate instantly without re-scouting."
+                f"📂 **{len(st.session_state.listings_df)} {mode_noun} already in this session.** "
+                "👈 Fill in Major and GPA — matches update as you refine your profile."
             )
         else:
-            st.info("👈  Fill in your Name, Major, and GPA in the sidebar to get started.")
+            st.info("👈  Fill in your Major and GPA in the sidebar to get started.")
     else:
         if mode_key == "scholarship":
             angles_preview = sum([bool(major), bool(states), bool(ethnicity), first_gen, income_based, True])
@@ -717,9 +868,13 @@ with tab1:
                     if mode_key == "scholarship":
                         matches = filter_scholarship_matches(df, major, gpa, states, ethnicity, first_gen, income_based)
                     elif mode_key == "internship":
-                        matches = filter_internship_matches(df, major, gpa, states, location_pref, class_year)
+                        matches = filter_internship_matches(
+                            df, major, gpa, states, location_pref, class_year, desired_role=desired_role,
+                        )
                     else:
-                        matches = filter_job_matches(df, major, gpa, states, location_pref, experience_level)
+                        matches = filter_job_matches(
+                            df, major, gpa, states, location_pref, experience_level, desired_role=desired_role,
+                        )
 
                     st.session_state.listings_df = df
                     st.session_state.matches_df  = matches
@@ -775,12 +930,14 @@ with tab1:
 
         if mode_key == "scholarship":
             col_config = {
+                "apply_url":  st.column_config.LinkColumn("Apply", display_text="Apply ↗"),
                 "source_url": st.column_config.LinkColumn("Source", display_text="Visit ↗"),
                 "amount":     st.column_config.NumberColumn("Amount ($)", format="$%d"),
                 "min_gpa":    st.column_config.NumberColumn("Min GPA", format="%.1f"),
             }
         else:
             col_config = {
+                "apply_url":  st.column_config.LinkColumn("Apply", display_text="Apply ↗"),
                 "source_url": st.column_config.LinkColumn("Source", display_text="Visit ↗"),
                 "min_gpa":    st.column_config.NumberColumn("Min GPA", format="%.1f"),
             }
@@ -816,17 +973,20 @@ with tab2:
 
     if mode_key == "scholarship":
         st.markdown(
-            '<div class="step-sub">Filtered to scholarships that fit your GPA, major, state, and demographics.</div>',
+            '<div class="step-sub">Ranked matches for your GPA, major, state, and demographics. '
+            "Unknown eligibility ranks below explicit fits.</div>",
             unsafe_allow_html=True,
         )
     elif mode_key == "internship":
         st.markdown(
-            '<div class="step-sub">Filtered to internships that fit your major, GPA, location, and class year.</div>',
+            '<div class="step-sub">Ranked by role fit, major, location, and class year. '
+            "Best matches first.</div>",
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            '<div class="step-sub">Filtered to jobs that fit your major, GPA, location, and experience level.</div>',
+            '<div class="step-sub">Ranked by role fit, major, location, and experience level. '
+            "Best matches first.</div>",
             unsafe_allow_html=True,
         )
 
@@ -851,14 +1011,18 @@ with tab2:
 
         if mode_key == "scholarship":
             col_config = {
-                "source_url": st.column_config.LinkColumn("Source", display_text="Visit ↗"),
-                "amount":     st.column_config.NumberColumn("Amount ($)", format="$%d"),
-                "min_gpa":    st.column_config.NumberColumn("Min GPA", format="%.1f"),
+                "match_score": st.column_config.NumberColumn("Score", format="%.1f"),
+                "apply_url":   st.column_config.LinkColumn("Apply", display_text="Apply ↗"),
+                "source_url":  st.column_config.LinkColumn("Source", display_text="Visit ↗"),
+                "amount":      st.column_config.NumberColumn("Amount ($)", format="$%d"),
+                "min_gpa":     st.column_config.NumberColumn("Min GPA", format="%.1f"),
             }
         else:
             col_config = {
-                "source_url": st.column_config.LinkColumn("Source", display_text="Visit ↗"),
-                "min_gpa":    st.column_config.NumberColumn("Min GPA", format="%.1f"),
+                "match_score": st.column_config.NumberColumn("Score", format="%.1f"),
+                "apply_url":   st.column_config.LinkColumn("Apply", display_text="Apply ↗"),
+                "source_url":  st.column_config.LinkColumn("Source", display_text="Visit ↗"),
+                "min_gpa":     st.column_config.NumberColumn("Min GPA", format="%.1f"),
             }
 
         st.dataframe(matches_display, use_container_width=True, column_config=col_config, hide_index=True)
@@ -875,9 +1039,8 @@ with tab2:
         )
 
         st.success(
-            f"**Step 2 complete!** {len(matches)} match(es) found. "
-            "👉 Click the **Drafts** tab, paste your profile in the sidebar, "
-            "and hit **Generate All Drafts**."
+            f"**Step 2 complete!** {len(matches)} match(es), best fits first. "
+            "👉 Open **Drafts**, add your resume, and generate letters for the top matches."
         )
 
 
@@ -886,32 +1049,14 @@ with tab2:
 # ─────────────────────────────────────────────────────────────────────────────
 with tab3:
     st.markdown('<div class="tag">Step 03</div>', unsafe_allow_html=True)
-    st.markdown('<div class="step-title">Draft Applications</div>', unsafe_allow_html=True)
-
-    if mode_key == "scholarship":
-        st.markdown(
-            '<div class="step-sub">'
-            "Reads each scholarship's live page and writes a personalized cover letter "
-            "grounded in your uploaded profile."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-    elif mode_key == "internship":
-        st.markdown(
-            '<div class="step-sub">'
-            "Reads each internship's live page and writes a personalized cover letter "
-            "grounded in your uploaded profile."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<div class="step-sub">'
-            "Reads each job listing's live page and writes a personalized cover letter "
-            "grounded in your uploaded profile."
-            "</div>",
-            unsafe_allow_html=True,
-        )
+    st.markdown('<div class="step-title">Draft cover letters</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="step-sub">'
+        "Uses the apply/detail page when available (not just the scout hit), plus extracted "
+        "listing facts and your profile — including your name for the sign-off."
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
     no_matches = st.session_state.matches_df is None or st.session_state.matches_df.empty
     no_resume  = not resume_text.strip()
@@ -919,17 +1064,32 @@ with tab3:
     if not api_key_set:
         st.warning(f"👈  Paste your {provider} API key in the sidebar to generate drafts.")
     elif no_matches:
-        st.info("Complete Step 1 first so there are matches to draft for.")
+        st.info("Complete Scout + Matches first so there is something to draft for.")
     elif no_resume:
-        st.warning("👈  Paste your profile or upload a resume in the sidebar before drafting.")
+        st.warning("👈  Upload a resume or paste your background in the sidebar before drafting.")
     else:
         matches = st.session_state.matches_df
-        st.write(f"Ready to draft **{len(matches)}** cover letter(s) for **{name or 'you'}**.")
+        max_draftable = min(10, len(matches))
+        default_n = min(3, max_draftable)
+        draft_n = st.slider(
+            "How many top matches to draft",
+            min_value=1,
+            max_value=max(1, max_draftable),
+            value=default_n,
+            help="Drafts the highest-ranked matches first to save time and API cost.",
+        )
+        if not name.strip():
+            st.caption("Tip: add your Full Name in the sidebar for a correct sign-off.")
+
+        st.write(
+            f"Ready to draft **{draft_n}** letter(s) for **{name or 'you'}** "
+            f"(from {len(matches)} ranked match(es))."
+        )
 
         draft_col, _ = st.columns([2, 3])
         with draft_col:
             draft_clicked = st.button(
-                "✏️  Generate All Drafts",
+                f"✏️  Generate top {draft_n} draft{'s' if draft_n != 1 else ''}",
                 type="primary",
                 disabled=st.session_state.is_drafting,
                 use_container_width=True,
@@ -938,23 +1098,28 @@ with tab3:
 
         if draft_clicked and not st.session_state.is_drafting:
             st.session_state.is_drafting = True
-            st.session_state.drafts      = {}
+            st.session_state.drafts = {}
             bar = st.progress(0, text="Starting...")
+            to_draft = matches.head(draft_n)
 
-            for i, (_, row) in enumerate(matches.iterrows()):
+            for i, (idx, row) in enumerate(to_draft.iterrows()):
                 display_name = row.get(_name_col, f"Item {i+1}")
                 if _is_career_mode and row.get("role"):
                     display_name = f"{row['role']} @ {display_name}"
-                bar.progress(i / len(matches), text=f"Writing: {display_name}...")
-                source_url = row.get("source_url", "")
+                display_name = f"{display_name} · #{i+1}"
+                bar.progress(i / max(len(to_draft), 1), text=f"Writing: {display_name}...")
+                apply_url = str(row.get("apply_url") or "").strip()
+                source_url = str(row.get("source_url") or "").strip()
+                link_url = apply_url if apply_url.startswith("http") else source_url
                 try:
                     essay = draft_application(
                         row, resume_text, mode=mode_key,
                         provider=provider, api_key=active_api_key, ollama_host=ollama_host,
+                        applicant_name=name.strip(), profile=draft_profile,
                     )
-                    st.session_state.drafts[display_name] = (essay, source_url)
+                    st.session_state.drafts[display_name] = (essay, link_url)
                 except Exception as e:
-                    st.session_state.drafts[display_name] = (f"Error generating draft: {e}", source_url)
+                    st.session_state.drafts[display_name] = (f"Error generating draft: {e}", link_url)
             bar.progress(1.0, text="All drafts complete!")
             st.session_state.is_drafting = False
 
@@ -970,11 +1135,11 @@ with tab3:
                         f'<div class="draft-body">{html.escape(essay)}</div>',
                         unsafe_allow_html=True,
                     )
-                    safe = "".join(x for x in str(item_name) if x.isalnum())
+                    safe = "".join(x for x in str(item_name) if x.isalnum())[:60]
                     st.download_button(
                         "⬇️  Download .txt",
                         data=essay,
-                        file_name=f"Draft_{safe}.txt",
+                        file_name=f"Draft_{safe or 'letter'}.txt",
                         mime="text/plain",
                         key=f"btn_dl_{safe}",
                     )

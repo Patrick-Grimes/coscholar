@@ -21,7 +21,7 @@ Built with Python, Streamlit, BeautifulSoup, and your choice of AI provider.
 
 ## Modes
 
-A **Looking for** control at the top of the sidebar switches the entire app between **Scholarship**, **Internship**, and **Job** mode. Each mode adapts the full pipeline:
+An **I want** control at the top of the sidebar switches the entire app between **Job**, **Internship**, and **Scholarship**. Career modes come first; Scholarship remains available. Each mode adapts the full pipeline:
 
 | | Scholarship | Internship | Job |
 |---|---|---|---|
@@ -34,6 +34,14 @@ A **Looking for** control at the top of the sidebar switches the entire app betw
 | **Database** | `scholarship_database.csv` | `internship_database.csv` | `job_database.csv` |
 
 Switching modes clears the current session data so results from different targets don't mix.
+
+### Matching & drafting quality
+
+- Search years follow the current calendar (and next year in fall recruiting) — not a hardcoded `2026`.
+- Fetches follow safe redirects and prefer `main`/`article` content with a larger HTML window.
+- Extractors can return an `apply_url`; cover letters ground on that page when present, plus structured listing facts and sidebar profile (including Name for sign-off).
+- Matches are scored and sorted (role fit, explicit major hits, apply URL, description). Empty eligibility is treated as **unknown** (soft-pass, lower rank), not “open to all.”
+- Internship/job filters use desired role; On-site means not Remote/Hybrid; Remote + states uses AND.
 
 ---
 

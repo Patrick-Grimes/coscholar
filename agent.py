@@ -1,6 +1,20 @@
+from datetime import date
 from ddgs import DDGS
 
 MAX_STATES_FOR_SEARCH = 4
+MAX_TOTAL_URLS = 24
+
+
+def _search_year() -> int:
+    return date.today().year
+
+
+def _year_token() -> str:
+    """Current year for queries; include next year during fall recruiting season."""
+    y = _search_year()
+    if date.today().month >= 9:
+        return f"{y} OR {y + 1}"
+    return str(y)
 
 
 # ── Scholarship queries ──────────────────────────────────────────────────────
@@ -12,6 +26,7 @@ def build_queries(profile: dict) -> list[str]:
     scholarships that have nothing to do with major.
     """
     queries = []
+    year = _year_token()
 
     major     = profile.get("major", "").strip()
     state     = profile.get("state", "").strip()
@@ -20,11 +35,9 @@ def build_queries(profile: dict) -> list[str]:
     first_gen = profile.get("first_gen", False)
     income    = profile.get("income_based", False)
 
-    # Major-specific (most targeted)
     if major:
-        queries.append(f"{major} scholarships 2026 apply")
+        queries.append(f"{major} scholarships {year} apply")
 
-    # State-based (one query per selected state, capped)
     if states:
         search_states = [s.strip() for s in states if s.strip()][:MAX_STATES_FOR_SEARCH]
     elif state:
@@ -33,22 +46,18 @@ def build_queries(profile: dict) -> list[str]:
         search_states = []
 
     for s in search_states:
-        queries.append(f"{s} state scholarships undergraduate 2026")
+        queries.append(f"{s} state scholarships undergraduate {year}")
 
-    # Demographic / identity
     if ethnicity and ethnicity.lower() not in ("", "prefer not to say"):
-        queries.append(f"{ethnicity} student scholarships 2026 apply")
+        queries.append(f"{ethnicity} student scholarships {year} apply")
 
-    # First-gen
     if first_gen:
-        queries.append("first generation college student scholarships 2026")
+        queries.append(f"first generation college student scholarships {year}")
 
-    # Need-based
     if income:
-        queries.append("need based undergraduate scholarships 2026 apply")
+        queries.append(f"need based undergraduate scholarships {year} apply")
 
-    # Broad catch-all — finds scholarships with no major restriction
-    queries.append("undergraduate scholarships 2026 no major restriction apply")
+    queries.append(f"undergraduate scholarships {year} no major restriction apply")
 
     return queries
 
@@ -60,27 +69,24 @@ def build_internship_queries(profile: dict) -> list[str]:
     Turns a student profile into targeted DDG search queries for internships.
     """
     queries = []
+    year = _year_token()
 
-    major        = profile.get("major", "").strip()
-    state        = profile.get("state", "").strip()
-    states       = profile.get("states") or []
-    desired_role = profile.get("desired_role", "").strip()
+    major         = profile.get("major", "").strip()
+    state         = profile.get("state", "").strip()
+    states        = profile.get("states") or []
+    desired_role  = profile.get("desired_role", "").strip()
     location_pref = profile.get("location_pref", "Any").strip()
-    class_year   = profile.get("class_year", "").strip()
+    class_year    = profile.get("class_year", "").strip()
 
-    # Role-specific
     if desired_role:
-        queries.append(f"{desired_role} internship summer 2026 apply")
+        queries.append(f"{desired_role} internship summer {year} apply")
 
-    # Major-specific
     if major:
-        queries.append(f"{major} internship 2026 undergraduate")
+        queries.append(f"{major} internship {year} undergraduate")
 
-    # Combined major + role
     if desired_role and major and desired_role.lower() != major.lower():
-        queries.append(f"{major} {desired_role} internship 2026")
+        queries.append(f"{major} {desired_role} internship {year}")
 
-    # State-based (one query per selected state, capped)
     if states:
         search_states = [s.strip() for s in states if s.strip()][:MAX_STATES_FOR_SEARCH]
     elif state:
@@ -89,18 +95,21 @@ def build_internship_queries(profile: dict) -> list[str]:
         search_states = []
 
     for s in search_states:
-        queries.append(f"internships in {s} undergraduate 2026")
+        queries.append(f"internships in {s} undergraduate {year}")
 
-    # Remote preference
-    if location_pref.lower() == "remote":
-        queries.append(f"remote internship {major or desired_role or 'undergraduate'} 2026")
+    loc = location_pref.lower()
+    focus = major or desired_role or "undergraduate"
+    if loc == "remote":
+        queries.append(f"remote internship {focus} {year}")
+    elif loc == "hybrid":
+        queries.append(f"hybrid internship {focus} {year}")
+    elif loc == "on-site":
+        queries.append(f"on-site in-person internship {focus} {year}")
 
-    # Class year
     if class_year:
-        queries.append(f"{class_year} student internship 2026 apply")
+        queries.append(f"{class_year} student internship {year} apply")
 
-    # Broad catch-all
-    queries.append("undergraduate internships summer 2026 apply")
+    queries.append(f"undergraduate internships summer {year} apply")
 
     return queries
 
@@ -112,27 +121,24 @@ def build_job_queries(profile: dict) -> list[str]:
     Turns a candidate profile into targeted DDG search queries for full-time jobs.
     """
     queries = []
+    year = _year_token()
 
-    major          = profile.get("major", "").strip()
-    state          = profile.get("state", "").strip()
-    states         = profile.get("states") or []
-    desired_role   = profile.get("desired_role", "").strip()
-    location_pref  = profile.get("location_pref", "Any").strip()
-    experience     = profile.get("experience_level", "").strip()
+    major         = profile.get("major", "").strip()
+    state         = profile.get("state", "").strip()
+    states        = profile.get("states") or []
+    desired_role  = profile.get("desired_role", "").strip()
+    location_pref = profile.get("location_pref", "Any").strip()
+    experience    = profile.get("experience_level", "").strip()
 
-    # Role-specific
     if desired_role:
-        queries.append(f"{desired_role} jobs hiring 2026 apply")
+        queries.append(f"{desired_role} jobs hiring {year} apply")
 
-    # Major / field-specific
     if major:
-        queries.append(f"{major} jobs entry level 2026 apply")
+        queries.append(f"{major} jobs entry level {year} apply")
 
-    # Combined major + role
     if desired_role and major and desired_role.lower() != major.lower():
-        queries.append(f"{major} {desired_role} jobs 2026")
+        queries.append(f"{major} {desired_role} jobs {year}")
 
-    # State-based (one query per selected state, capped)
     if states:
         search_states = [s.strip() for s in states if s.strip()][:MAX_STATES_FOR_SEARCH]
     elif state:
@@ -141,44 +147,55 @@ def build_job_queries(profile: dict) -> list[str]:
         search_states = []
 
     for s in search_states:
-        queries.append(f"jobs in {s} {desired_role or major or 'professional'} 2026")
+        queries.append(f"jobs in {s} {desired_role or major or 'professional'} {year}")
 
-    # Remote preference
-    if location_pref.lower() == "remote":
-        queries.append(f"remote {desired_role or major or 'software'} jobs 2026 apply")
+    loc = location_pref.lower()
+    focus = desired_role or major or "software"
+    if loc == "remote":
+        queries.append(f"remote {focus} jobs {year} apply")
+    elif loc == "hybrid":
+        queries.append(f"hybrid {focus} jobs {year} apply")
+    elif loc == "on-site":
+        queries.append(f"on-site in-person {focus} jobs {year} apply")
 
-    # Experience level
     if experience:
-        queries.append(f"{experience} {desired_role or major or 'professional'} jobs 2026 apply")
+        queries.append(f"{experience} {desired_role or major or 'professional'} jobs {year} apply")
 
-    # Broad catch-all
-    queries.append("entry level jobs hiring 2026 apply")
+    queries.append(f"entry level jobs hiring {year} apply")
 
     return queries
 
 
 # ── Shared search runner ─────────────────────────────────────────────────────
 
-def _run_search(queries: list[str], max_results: int) -> list[str]:
+def _run_search(queries: list[str], max_results: int, max_total: int = MAX_TOTAL_URLS) -> list[str]:
     """Runs DDG searches for a list of queries, returns deduplicated URLs."""
     print(f"Running {len(queries)} search queries based on profile...")
 
     seen = set()
     urls = []
+    failed = 0
 
     for query in queries:
+        if len(urls) >= max_total:
+            break
         print(f"  Searching: '{query}'")
         try:
             results = DDGS().text(query, max_results=max_results)
             for r in results:
-                if r["href"] not in seen:
-                    seen.add(r["href"])
-                    urls.append(r["href"])
-                    print(f"    ↳ {r['title']}")
+                if len(urls) >= max_total:
+                    break
+                href = r.get("href") or ""
+                if href and href not in seen:
+                    seen.add(href)
+                    urls.append(href)
+                    print(f"    ↳ {r.get('title', href)}")
         except Exception as e:
+            failed += 1
             print(f"  Search failed for '{query}': {e}")
 
-    print(f"\n✅ {len(urls)} unique URLs collected across all queries.")
+    print(f"\n✅ {len(urls)} unique URLs collected across all queries"
+          f"{f' ({failed} angle(s) failed)' if failed else ''}.")
     return urls
 
 
