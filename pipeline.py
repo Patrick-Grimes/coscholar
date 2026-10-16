@@ -1,7 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import json
+import re
 import time
 import datetime
 import ipaddress
@@ -9,17 +9,22 @@ from urllib.parse import urlparse
 import socket
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from ai_scraper import extract_scholarship_data, extract_internship_data
+from ai_scraper import extract_scholarship_data, extract_internship_data, extract_job_data
 
 _EXTRACT_FNS = {
     "scholarship": extract_scholarship_data,
     "internship":  extract_internship_data,
+    "job":         extract_job_data,
 }
 
 _DATA_KEYS = {
     "scholarship": "scholarships",
     "internship":  "internships",
+    "job":         "jobs",
 }
+
+_MAX_HTML_CHARS = 40000
+_MAX_REDIRECTS = 5
 
 
 @retry(
@@ -63,10 +68,19 @@ def _is_safe_url(url: str) -> bool:
     return True
 
 
-def fetch_and_clean_html(url):
+def _prefer_content_root(soup: BeautifulSoup):
+    """Prefer main/article over full body to keep opportunity text in the window."""
+    for selector in ("main", "article", "[role=main]", "#content", ".content"):
+        node = soup.select_one(selector) if selector.startswith(("[", ".", "#")) else soup.find(selector)
+        if node and len(node.get_text(strip=True)) > 200:
+            return node
+    return soup.body or soup
+
+
+def fetch_and_clean_html(url, max_chars: int = _MAX_HTML_CHARS):
     """
-    Downloads a webpage and strips scripts, styles, and junk
-    to save tokens when sending to the LLM.
+    Downloads a webpage (following safe redirects), strips scripts/styles,
+    and returns a cleaned HTML snippet sized for LLM extraction/drafting.
     """
     if not _is_safe_url(url):
         print(f"Blocked unsafe URL: {url}")
@@ -75,24 +89,101 @@ def fetch_and_clean_html(url):
     print(f"Fetching: {url}...")
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        )
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=(5, 10), allow_redirects=False)
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=(5, 15),
+            allow_redirects=True,
+        )
         response.raise_for_status()
+
+        # Re-validate the final URL after redirects (SSRF).
+        final_url = response.url or url
+        if response.history and len(response.history) > _MAX_REDIRECTS:
+            print(f"Blocked too many redirects for: {url}")
+            return None
+        if not _is_safe_url(final_url):
+            print(f"Blocked unsafe redirect target: {final_url}")
+            return None
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        for tag in soup(["script", "style", "img", "svg", "nav", "footer"]):
+        for tag in soup(["script", "style", "img", "svg", "nav", "footer", "noscript", "iframe"]):
             tag.decompose()
 
-        clean_html = str(soup.body)[:15000]
+        root = _prefer_content_root(soup)
+        clean_html = str(root)[:max_chars]
         return clean_html
 
     except Exception as e:
         print(f"Failed to fetch {url}: {e}")
         return None
+
+
+def _parse_deadline_date(deadline: str):
+    """
+    Best-effort parse of a deadline string into a date.
+    Returns None when we cannot confidently parse.
+    """
+    text = deadline.strip()
+    if not text:
+        return None
+
+    # Prefer the latest year mentioned (handles "Fall 2025 / Spring 2026").
+    years = [int(y) for y in re.findall(r"\b(20\d{2})\b", text)]
+    # Academic ranges like "2025–26" / "2025-26" → end year 2026.
+    for m in re.finditer(r"\b(20\d{2})\s*[–\-—/]\s*(\d{2})\b", text):
+        years.append(int(m.group(1)[:2] + m.group(2)))
+    year = max(years) if years else None
+
+    month_map = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+        "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "sept": 9,
+        "september": 9, "oct": 10, "october": 10, "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+    lower = text.lower()
+    month = None
+    for name, num in month_map.items():
+        if re.search(rf"\b{name}\b", lower):
+            month = num
+            break
+
+    day_match = re.search(r"\b(\d{1,2})(st|nd|rd|th)?\b", lower)
+    day = int(day_match.group(1)) if day_match else None
+    if day is not None and (day < 1 or day > 31):
+        day = None
+
+    # ISO-ish YYYY-MM-DD
+    iso = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text)
+    if iso:
+        try:
+            return datetime.date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            pass
+
+    if year and month:
+        try:
+            return datetime.date(year, month, day or 28)
+        except ValueError:
+            try:
+                return datetime.date(year, month, 28)
+            except ValueError:
+                return None
+
+    # Year only → treat as end of that year.
+    if year and not month:
+        return datetime.date(year, 12, 31)
+
+    return None
 
 
 def is_listing_active(item: dict) -> bool:
@@ -103,27 +194,38 @@ def is_listing_active(item: dict) -> bool:
     """
     deadline = str(item.get("deadline", "")).strip().lower()
 
-    if not deadline or deadline in ("", "nan", "none", "rolling", "varies"):
+    if not deadline or deadline in ("", "nan", "none", "rolling", "varies", "open", "ongoing"):
         return True
 
-    current_year  = datetime.datetime.now().year
-    current_month = datetime.datetime.now().month
+    parsed = _parse_deadline_date(deadline)
+    if parsed is None:
+        return True
 
-    for year in range(2020, current_year):
-        if str(year) in deadline:
-            return False
+    return parsed >= datetime.date.today()
 
-    month_map = {
-        "jan": 1, "feb": 2, "mar": 3, "apr": 4,  "may": 5,  "jun": 6,
-        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+
+def _normalize_apply_url(item: dict, scout_url: str) -> dict:
+    """Prefer an extracted apply/detail URL when present and safe; else keep source for drafting."""
+    item["source_url"] = scout_url
+    apply = str(item.get("apply_url") or "").strip()
+    if apply.startswith("http") and _is_safe_url(apply):
+        item["apply_url"] = apply
+    else:
+        # Fall back to the scouted page so drafts still have a link target.
+        item["apply_url"] = scout_url if scout_url.startswith("http") else ""
+    return item
+
+
+def empty_pipeline_stats() -> dict:
+    return {
+        "urls_total": 0,
+        "fetched": 0,
+        "fetch_failed": 0,
+        "extracted": 0,
+        "validation_dropped": 0,
+        "deadline_filtered": 0,
+        "active": 0,
     }
-    for abbr, month_num in month_map.items():
-        if abbr in deadline:
-            if str(current_year) in deadline and month_num < current_month:
-                return False
-            break
-
-    return True
 
 
 def run_pipeline(
@@ -133,21 +235,21 @@ def run_pipeline(
     provider: str = "Gemini",
     api_key: str = None,
     ollama_host: str = None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
     """
     Fetches each URL, extracts listings via LLM, filters out inactive
-    ones, and returns the results as a DataFrame (in-memory only).
+    ones, and returns (DataFrame, stats).
 
-    Args:
-        urls:              List of URLs to scrape.
-        mode:              "scholarship" or "internship".
-        progress_callback: Optional callable invoked after each URL is processed.
-    Returns:
-        A pandas DataFrame of active listings (may be empty).
+    Stats keys: urls_total, fetched, fetch_failed, extracted,
+    validation_dropped, deadline_filtered, active.
+
+    progress_callback may receive optional kwargs: stats=dict, done=bool.
     """
     data_key = _DATA_KEYS[mode]
     all_items = []
     total = len(urls)
+    stats = empty_pipeline_stats()
+    stats["urls_total"] = total
 
     for i, url in enumerate(urls):
         if progress_callback:
@@ -156,35 +258,53 @@ def run_pipeline(
                 site_num=i + 1,
                 total_sites=total,
                 found_so_far=len(all_items),
+                stats=dict(stats),
             )
 
         html_content = fetch_and_clean_html(url)
 
         if not html_content:
+            stats["fetch_failed"] += 1
             print(f"  -> Skipping {url} (fetch failed)")
             continue
 
+        stats["fetched"] += 1
         print(f"  -> Sending to {provider}...")
         time.sleep(1)
 
         try:
-            data       = _extract_with_retry(html_content, mode=mode, provider=provider, api_key=api_key, ollama_host=ollama_host)
+            data = _extract_with_retry(
+                html_content, mode=mode, provider=provider, api_key=api_key, ollama_host=ollama_host,
+            )
             found_list = data.get(data_key, [])
+            extract_stats = data.get("_stats") or {}
+            stats["extracted"] += int(extract_stats.get("coerced", len(found_list)))
+            stats["validation_dropped"] += int(extract_stats.get("validation_dropped", 0))
 
-            active   = 0
+            active = 0
             inactive = 0
             for item in found_list:
-                item["source_url"] = url
+                item = _normalize_apply_url(item, url)
                 if is_listing_active(item):
                     all_items.append(item)
                     active += 1
                 else:
                     inactive += 1
 
-            print(f"  -> {active} active, {inactive} filtered as closed/expired")
+            stats["deadline_filtered"] += inactive
+            stats["active"] = len(all_items)
+            print(
+                f"  -> {active} active, {inactive} deadline-filtered "
+                f"(extract kept {extract_stats.get('coerced', len(found_list))}, "
+                f"dropped {extract_stats.get('validation_dropped', 0)})"
+            )
 
         except Exception as e:
+            # Treat hard extract failures as validation drops for UI explainability.
+            stats["validation_dropped"] += 1
             print(f"  -> Error processing {url}: {e}")
+
+    stats["active"] = len(all_items)
 
     if progress_callback and urls:
         progress_callback(
@@ -192,6 +312,7 @@ def run_pipeline(
             site_num=total,
             total_sites=total,
             found_so_far=len(all_items),
+            stats=dict(stats),
             done=True,
         )
 
@@ -199,20 +320,35 @@ def run_pipeline(
         df = pd.DataFrame(all_items)
         df = df.fillna("")
         print(f"\n--- Session Results: {len(df)} active {mode}s ---")
-        return df
+        print(
+            f"    stats: fetched={stats['fetched']}/{stats['urls_total']} "
+            f"extracted={stats['extracted']} "
+            f"validation_dropped={stats['validation_dropped']} "
+            f"deadline_filtered={stats['deadline_filtered']}"
+        )
+        return df, stats
 
     print(f"\nNo active {mode}s found.")
-    return pd.DataFrame()
+    print(
+        f"    stats: fetched={stats['fetched']}/{stats['urls_total']} "
+        f"extracted={stats['extracted']} "
+        f"validation_dropped={stats['validation_dropped']} "
+        f"deadline_filtered={stats['deadline_filtered']}"
+    )
+    return pd.DataFrame(), stats
 
 
 # Backward-compatible alias
 def run_scholarship_pipeline(urls, progress_callback=None, provider="Gemini", api_key=None, ollama_host=None):
-    return run_pipeline(urls, mode="scholarship", progress_callback=progress_callback,
-                        provider=provider, api_key=api_key, ollama_host=ollama_host)
+    df, _stats = run_pipeline(
+        urls, mode="scholarship", progress_callback=progress_callback,
+        provider=provider, api_key=api_key, ollama_host=ollama_host,
+    )
+    return df
 
 
 if __name__ == "__main__":
     target_urls = [
         "https://www.careeronestop.org/Toolkit/Training/find-scholarships.aspx?keyword=data%20science&sortcolumns=BestMatch&sortdirections=Descending&p=1",
     ]
-    run_pipeline(target_urls, mode="scholarship")
+    run_pipeline(target_urls, mode="scholarship")  # returns (df, stats)
