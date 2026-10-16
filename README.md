@@ -1,8 +1,8 @@
-# CoScholar - Autonomous Scholarship & Internship Agent
+# CoScholar - Autonomous Scholarship, Internship & Job Agent
 
 🔗 [Live Demo](https://coscholar-ai.streamlit.app)
 
-An end-to-end agentic pipeline that scouts the web for **scholarships or internships**, filters them against a student profile, and drafts personalized cover letters using RAG (Retrieval-Augmented Generation).
+An end-to-end agentic pipeline that scouts the web for **scholarships, internships, or jobs**, filters them against a student/candidate profile, and drafts personalized cover letters using RAG (Retrieval-Augmented Generation).
 
 Built with Python, Streamlit, BeautifulSoup, and your choice of AI provider.
 
@@ -21,19 +21,19 @@ Built with Python, Streamlit, BeautifulSoup, and your choice of AI provider.
 
 ## Modes
 
-A toggle at the top of the sidebar switches the entire app between **Scholarship** and **Internship** mode. Each mode adapts the full pipeline:
+A **Looking for** control at the top of the sidebar switches the entire app between **Scholarship**, **Internship**, and **Job** mode. Each mode adapts the full pipeline:
 
-| | Scholarship Mode | Internship Mode |
-|---|---|---|
-| **Branding** | CoScholar AI | CoIntern AI |
-| **Profile fields** | Major, GPA, state, ethnicity, first-gen, income-based | Major, GPA, state, desired role, location preference, class year |
-| **Search queries** | Major-specific, state-based, demographic, need-based | Role-specific, major-based, location-based, class-year |
-| **Extraction schema** | Name, amount, deadline, GPA, majors, states, ethnicity, first-gen, income-based | Company, role, location, skills, majors, GPA, class year, paid, compensation, deadline |
-| **Matching logic** | GPA, major, state, ethnicity, first-gen, income | GPA, major, location preference, class year |
-| **Cover letter tone** | Scholarship applicant — mission alignment, community impact | Internship candidate — skills, projects, company connection |
-| **Database** | `scholarship_database.csv` | `internship_database.csv` |
+| | Scholarship | Internship | Job |
+|---|---|---|---|
+| **Branding** | CoScholar AI | CoIntern AI | CoJobs AI |
+| **Profile fields** | Major, GPA, state, ethnicity, first-gen, income-based | Major, GPA, state, desired role, location preference, class year | Major, GPA, state, desired role, location preference, experience level |
+| **Search queries** | Major-specific, state-based, demographic, need-based | Role-specific, major-based, location-based, class-year | Role-specific, field-based, location-based, experience-level |
+| **Extraction schema** | Name, amount, deadline, GPA, majors, states, ethnicity, first-gen, income-based | Company, role, location, skills, majors, GPA, class year, paid, compensation, deadline | Company, role, location, skills, majors, GPA, experience level, employment type, compensation, deadline |
+| **Matching logic** | GPA, major, state, ethnicity, first-gen, income | GPA, major, location preference, class year | GPA, major, location preference, experience level |
+| **Cover letter tone** | Scholarship applicant — mission alignment, community impact | Internship candidate — skills, projects, company connection | Job candidate — impact, ownership, day-one readiness |
+| **Database** | `scholarship_database.csv` | `internship_database.csv` | `job_database.csv` |
 
-Switching modes clears the current session data so scholarship and internship results don't mix.
+Switching modes clears the current session data so results from different targets don't mix.
 
 ---
 
@@ -103,12 +103,12 @@ streamlit run app.py
 coscholar/
 ├── .streamlit/
 │   └── config.toml      # Dark theme config
-├── app.py               # Streamlit UI, mode toggle, filtering logic (both modes)
-├── agent.py             # Multi-query web discovery — scholarship & internship queries
+├── app.py               # Streamlit UI, mode toggle, filtering logic (all modes)
+├── agent.py             # Multi-query web discovery — scholarship, internship & job queries
 ├── llm.py               # Unified AI provider interface (Gemini/Claude/OpenAI/Ollama)
 ├── pipeline.py          # HTML fetch, clean, SSRF validation, mode-aware orchestration
-├── ai_scraper.py        # AI-based structured extraction — scholarship & internship schemas
-├── drafter.py           # RAG cover letter generation — scholarship & internship prompts
+├── ai_scraper.py        # AI-based structured extraction — scholarship, internship & job schemas
+├── drafter.py           # RAG cover letter generation — scholarship, internship & job prompts
 └── requirements.txt
 ```
 
@@ -127,8 +127,8 @@ coscholar/
 ## Notes
 
 - Works best on static HTML pages. JavaScript-heavy SPAs (React/Angular) return limited results.
-- Each mode persists its own database locally (`scholarship_database.csv` / `internship_database.csv`) and auto-loads on browser refresh.
+- Each mode persists its own database locally (`scholarship_database.csv` / `internship_database.csv` / `job_database.csv`) and auto-loads on browser refresh.
 - AI calls use exponential backoff retry (via `tenacity`) to handle rate limits gracefully.
-- Filtering logic lives in `app.py` (`filter_scholarship_matches()` and `filter_internship_matches()`). It runs on scout completion and reactively as you update your profile in the sidebar.
+- Filtering logic lives in `app.py` (`filter_scholarship_matches()`, `filter_internship_matches()`, and `filter_job_matches()`). It runs on scout completion and reactively as you update your profile in the sidebar.
 - Each draft includes an "Apply here" link to the original source URL so you know where to submit your application.
 - The Matches and Scout tables show clickable "Visit" links for every listing's source page.

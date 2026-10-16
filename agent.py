@@ -105,6 +105,58 @@ def build_internship_queries(profile: dict) -> list[str]:
     return queries
 
 
+# ── Job queries ───────────────────────────────────────────────────────────────
+
+def build_job_queries(profile: dict) -> list[str]:
+    """
+    Turns a candidate profile into targeted DDG search queries for full-time jobs.
+    """
+    queries = []
+
+    major          = profile.get("major", "").strip()
+    state          = profile.get("state", "").strip()
+    states         = profile.get("states") or []
+    desired_role   = profile.get("desired_role", "").strip()
+    location_pref  = profile.get("location_pref", "Any").strip()
+    experience     = profile.get("experience_level", "").strip()
+
+    # Role-specific
+    if desired_role:
+        queries.append(f"{desired_role} jobs hiring 2026 apply")
+
+    # Major / field-specific
+    if major:
+        queries.append(f"{major} jobs entry level 2026 apply")
+
+    # Combined major + role
+    if desired_role and major and desired_role.lower() != major.lower():
+        queries.append(f"{major} {desired_role} jobs 2026")
+
+    # State-based (one query per selected state, capped)
+    if states:
+        search_states = [s.strip() for s in states if s.strip()][:MAX_STATES_FOR_SEARCH]
+    elif state:
+        search_states = [state]
+    else:
+        search_states = []
+
+    for s in search_states:
+        queries.append(f"jobs in {s} {desired_role or major or 'professional'} 2026")
+
+    # Remote preference
+    if location_pref.lower() == "remote":
+        queries.append(f"remote {desired_role or major or 'software'} jobs 2026 apply")
+
+    # Experience level
+    if experience:
+        queries.append(f"{experience} {desired_role or major or 'professional'} jobs 2026 apply")
+
+    # Broad catch-all
+    queries.append("entry level jobs hiring 2026 apply")
+
+    return queries
+
+
 # ── Shared search runner ─────────────────────────────────────────────────────
 
 def _run_search(queries: list[str], max_results: int) -> list[str]:
@@ -136,6 +188,10 @@ def find_scholarship_urls(profile: dict, max_results: int = 5) -> list[str]:
 
 def find_internship_urls(profile: dict, max_results: int = 5) -> list[str]:
     return _run_search(build_internship_queries(profile), max_results)
+
+
+def find_job_urls(profile: dict, max_results: int = 5) -> list[str]:
+    return _run_search(build_job_queries(profile), max_results)
 
 
 if __name__ == "__main__":

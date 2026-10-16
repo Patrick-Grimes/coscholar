@@ -7,7 +7,7 @@ import pdfplumber
 import io
 from io import StringIO
 
-from agent import find_scholarship_urls, find_internship_urls
+from agent import find_scholarship_urls, find_internship_urls, find_job_urls
 from pipeline import run_pipeline
 from drafter import draft_application
 from dotenv import load_dotenv
@@ -21,6 +21,22 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── Mode helpers ──────────────────────────────────────────────────────────────
+MODES = ["Scholarship", "Internship", "Job"]
+MODE_KEYS = {"Scholarship": "scholarship", "Internship": "internship", "Job": "job"}
+MODE_NOUNS = {"scholarship": "scholarships", "internship": "internships", "job": "jobs"}
+MODE_ICONS = {"Scholarship": "🎓", "Internship": "💼", "Job": "🏢"}
+MODE_TITLES = {
+    "Scholarship": "CoScholar **AI**",
+    "Internship":  "CoIntern **AI**",
+    "Job":         "CoJobs **AI**",
+}
+MODE_SUBTITLES = {
+    "Scholarship": "Discovery → Filtering → Drafting, end-to-end.",
+    "Internship":  "Scout → Match → Draft, end-to-end.",
+    "Job":         "Scout → Match → Draft, end-to-end.",
+}
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -218,6 +234,56 @@ def filter_internship_matches(
     return df[mask].copy()
 
 
+def filter_job_matches(
+    df: pd.DataFrame,
+    major: str,
+    gpa: float,
+    states: list[str],
+    location_pref: str = "Any",
+    experience_level: str = "",
+) -> pd.DataFrame:
+
+    gpa_col = pd.to_numeric(df.get("min_gpa", pd.Series()), errors="coerce").fillna(0.0)
+    gpa_mask = gpa_col <= gpa
+
+    major_col = _col(df, "preferred_majors")
+    terms = major_terms(major)
+    major_match = pd.Series([False] * len(df))
+    for term in terms:
+        major_match = major_match | major_col.str.contains(term, case=False, regex=False)
+    major_mask = _is_open(major_col) | major_match
+
+    loc_col = _col(df, "location")
+    if location_pref and location_pref != "Any":
+        location_pref_mask = loc_col.str.contains(location_pref, case=False, regex=False)
+    else:
+        location_pref_mask = pd.Series([True] * len(df))
+
+    if states:
+        state_location_mask = pd.Series([False] * len(df))
+        for s in states:
+            s_clean = (s or "").strip()
+            if not s_clean:
+                continue
+            state_location_mask = state_location_mask | loc_col.str.contains(s_clean, case=False, regex=False)
+    else:
+        state_location_mask = pd.Series([True] * len(df))
+
+    if (location_pref and location_pref != "Any") and states:
+        location_mask = location_pref_mask | state_location_mask
+    else:
+        location_mask = location_pref_mask & state_location_mask
+
+    if experience_level:
+        exp_col = _col(df, "experience_level")
+        experience_mask = _is_open(exp_col) | exp_col.str.contains(experience_level, case=False, regex=False)
+    else:
+        experience_mask = pd.Series([True] * len(df))
+
+    mask = gpa_mask & major_mask & location_mask & experience_mask
+    return df[mask].copy()
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 for key, default in [
     ("mode",            "Scholarship"),
@@ -235,16 +301,17 @@ for key, default in [
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🎓 CoScholar")
-    st.caption("Autonomous Scholarship & Internship Agent")
+    st.caption("Autonomous Scholarship, Internship & Job Agent")
     st.caption("Results are stored only for this browser session.")
     st.divider()
 
     # Mode toggle
-    st.markdown('<div class="slabel">Mode</div>', unsafe_allow_html=True)
+    st.markdown('<div class="slabel">Looking for</div>', unsafe_allow_html=True)
+    mode_index = MODES.index(st.session_state.mode) if st.session_state.mode in MODES else 0
     new_mode = st.radio(
-        "Mode",
-        ["Scholarship", "Internship"],
-        index=0 if st.session_state.mode == "Scholarship" else 1,
+        "Looking for",
+        MODES,
+        index=mode_index,
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -258,8 +325,8 @@ with st.sidebar:
         st.rerun()
 
     mode = st.session_state.mode
-    mode_key = mode.lower()  # "scholarship" or "internship"
-    mode_noun = "scholarships" if mode_key == "scholarship" else "internships"
+    mode_key = MODE_KEYS[mode]  # "scholarship", "internship", or "job"
+    mode_noun = MODE_NOUNS[mode_key]
 
     st.divider()
 
@@ -319,13 +386,26 @@ with st.sidebar:
         desired_role = ""
         location_pref = "Any"
         class_year = ""
-    else:
+        experience_level = ""
+    elif mode_key == "internship":
         ethnicity = ""
         first_gen = False
         income_based = False
+        experience_level = ""
         desired_role  = st.text_input("Desired Role / Title", placeholder="Software Engineering Intern", max_chars=100)
         location_pref = st.selectbox("Location Preference", ["Any", "Remote", "Hybrid", "On-site"])
         class_year    = st.selectbox("Class Year", ["", "Freshman", "Sophomore", "Junior", "Senior"])
+    else:  # job
+        ethnicity = ""
+        first_gen = False
+        income_based = False
+        class_year = ""
+        desired_role  = st.text_input("Desired Role / Title", placeholder="Software Engineer", max_chars=100)
+        location_pref = st.selectbox("Location Preference", ["Any", "Remote", "Hybrid", "On-site"])
+        experience_level = st.selectbox(
+            "Experience Level",
+            ["", "Entry-level", "New Grad", "Mid-level", "Senior"],
+        )
 
     # Auto-filter on profile change
     if st.session_state.listings_df is not None and major.strip() and gpa > 0:
@@ -334,10 +414,15 @@ with st.sidebar:
                 st.session_state.listings_df, major, gpa, states,
                 ethnicity, first_gen, income_based,
             )
-        else:
+        elif mode_key == "internship":
             st.session_state.matches_df = filter_internship_matches(
                 st.session_state.listings_df, major, gpa, states,
                 location_pref, class_year,
+            )
+        else:
+            st.session_state.matches_df = filter_job_matches(
+                st.session_state.listings_df, major, gpa, states,
+                location_pref, experience_level,
             )
 
     st.divider()
@@ -433,18 +518,11 @@ with st.sidebar:
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
-_ICONS = {"Scholarship": "🎓", "Internship": "💼"}
-_TITLES = {"Scholarship": "CoScholar **AI**", "Internship": "CoIntern **AI**"}
-_SUBTITLES = {
-    "Scholarship": "Discovery → Filtering → Drafting, end-to-end.",
-    "Internship":  "Scout → Match → Draft, end-to-end.",
-}
-
 title_col, pill_col = st.columns([5, 1])
 with title_col:
-    st.markdown(f"# {_TITLES[mode]}")
-    st.caption(_SUBTITLES[mode])
-    st.caption("Switch between Scholarship and Internship mode in the sidebar.")
+    st.markdown(f"# {MODE_TITLES[mode]}")
+    st.caption(MODE_SUBTITLES[mode])
+    st.caption("Choose Scholarship, Internship, or Job in the sidebar.")
 with pill_col:
     if st.session_state.listings_df is not None:
         n = len(st.session_state.listings_df)
@@ -469,6 +547,7 @@ profile_ready  = all([name.strip(), major.strip(), gpa > 0])
 
 # The name column used to identify a listing in drafts/display
 _name_col = "name" if mode_key == "scholarship" else "company"
+_is_career_mode = mode_key in ("internship", "job")
 
 tab1, tab2, tab3 = st.tabs(["  🔍  Scout  ", "  📋  Matches  ", "  ✏️  Drafts  "])
 
@@ -501,8 +580,10 @@ with tab1:
     else:
         if mode_key == "scholarship":
             angles_preview = sum([bool(major), bool(states), bool(ethnicity), first_gen, income_based, True])
-        else:
+        elif mode_key == "internship":
             angles_preview = sum([bool(desired_role), bool(major), bool(states), location_pref == "Remote", bool(class_year), True])
+        else:
+            angles_preview = sum([bool(desired_role), bool(major), bool(states), location_pref == "Remote", bool(experience_level), True])
         est_min = max(1, round((angles_preview * max_results * 4) / 60))
         st.caption(
             f"⏱ Estimated time: **{est_min}–{est_min + 1} min** "
@@ -544,7 +625,7 @@ with tab1:
                         "first_gen": first_gen,
                         "income_based": income_based,
                     }
-                else:
+                elif mode_key == "internship":
                     angles = []
                     if desired_role: angles.append(f"role ({desired_role})")
                     if major:        angles.append(f"major ({major})")
@@ -561,6 +642,23 @@ with tab1:
                         "location_pref": location_pref,
                         "class_year": class_year,
                     }
+                else:
+                    angles = []
+                    if desired_role: angles.append(f"role ({desired_role})")
+                    if major:        angles.append(f"field ({major})")
+                    if state_label:  angles.append(f"states ({state_label})")
+                    if location_pref == "Remote": angles.append("remote")
+                    if experience_level: angles.append(f"experience ({experience_level})")
+                    angles.append("general")
+
+                    profile = {
+                        "major": major,
+                        "state": primary_state,
+                        "states": states,
+                        "desired_role": desired_role,
+                        "location_pref": location_pref,
+                        "experience_level": experience_level,
+                    }
 
                 st.write(f"🔎 Running **{len(angles)} searches:** {', '.join(angles)}")
 
@@ -568,8 +666,10 @@ with tab1:
                 try:
                     if mode_key == "scholarship":
                         urls = find_scholarship_urls(profile, max_results=max_results)
-                    else:
+                    elif mode_key == "internship":
                         urls = find_internship_urls(profile, max_results=max_results)
+                    else:
+                        urls = find_job_urls(profile, max_results=max_results)
                 except Exception as e:
                     st.session_state.is_scouting = False
                     status.update(label=f"❌ Search failed: {e}", state="error", expanded=False)
@@ -616,8 +716,10 @@ with tab1:
                 if df is not None and not df.empty:
                     if mode_key == "scholarship":
                         matches = filter_scholarship_matches(df, major, gpa, states, ethnicity, first_gen, income_based)
-                    else:
+                    elif mode_key == "internship":
                         matches = filter_internship_matches(df, major, gpa, states, location_pref, class_year)
+                    else:
+                        matches = filter_job_matches(df, major, gpa, states, location_pref, experience_level)
 
                     st.session_state.listings_df = df
                     st.session_state.matches_df  = matches
@@ -658,11 +760,16 @@ with tab1:
         if mode_key == "scholarship":
             avg_amt = pd.to_numeric(df.get("amount", pd.Series()), errors="coerce").mean()
             c3.metric("Avg Award", f"${int(avg_amt):,}" if not pd.isna(avg_amt) else "—")
-        else:
+        elif mode_key == "internship":
             paid_col = _col(df, "paid")
             n_paid = paid_col.str.lower().isin(["true", "1"]).sum()
             pct = int(100 * n_paid / len(df)) if len(df) > 0 else 0
             c3.metric("Paid", f"{pct}%")
+        else:
+            ft_col = _col(df, "employment_type")
+            n_ft = ft_col.str.contains("full", case=False, regex=False).sum()
+            pct = int(100 * n_ft / len(df)) if len(df) > 0 else 0
+            c3.metric("Full-time", f"{pct}%")
 
         st.markdown("##### Full Database")
 
@@ -683,7 +790,7 @@ with tab1:
         # Per-session full database download
         db_buf = StringIO()
         df.to_csv(db_buf, index=False)
-        db_filename = "scholarship_database_session.csv" if mode_key == "scholarship" else "internship_database_session.csv"
+        db_filename = f"{mode_key}_database_session.csv"
         st.download_button(
             "⬇️  Download Full Database CSV",
             data=db_buf.getvalue(),
@@ -712,9 +819,14 @@ with tab2:
             '<div class="step-sub">Filtered to scholarships that fit your GPA, major, state, and demographics.</div>',
             unsafe_allow_html=True,
         )
-    else:
+    elif mode_key == "internship":
         st.markdown(
             '<div class="step-sub">Filtered to internships that fit your major, GPA, location, and class year.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="step-sub">Filtered to jobs that fit your major, GPA, location, and experience level.</div>',
             unsafe_allow_html=True,
         )
 
@@ -753,7 +865,7 @@ with tab2:
 
         buf = StringIO()
         matches.to_csv(buf, index=False)
-        dl_name = "my_scholarship_matches.csv" if mode_key == "scholarship" else "my_internship_matches.csv"
+        dl_name = f"my_{mode_key}_matches.csv"
         st.download_button(
             "⬇️  Download Matches CSV",
             data=buf.getvalue(),
@@ -784,10 +896,18 @@ with tab3:
             "</div>",
             unsafe_allow_html=True,
         )
-    else:
+    elif mode_key == "internship":
         st.markdown(
             '<div class="step-sub">'
             "Reads each internship's live page and writes a personalized cover letter "
+            "grounded in your uploaded profile."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="step-sub">'
+            "Reads each job listing's live page and writes a personalized cover letter "
             "grounded in your uploaded profile."
             "</div>",
             unsafe_allow_html=True,
@@ -823,7 +943,7 @@ with tab3:
 
             for i, (_, row) in enumerate(matches.iterrows()):
                 display_name = row.get(_name_col, f"Item {i+1}")
-                if mode_key == "internship" and row.get("role"):
+                if _is_career_mode and row.get("role"):
                     display_name = f"{row['role']} @ {display_name}"
                 bar.progress(i / len(matches), text=f"Writing: {display_name}...")
                 source_url = row.get("source_url", "")
@@ -859,7 +979,7 @@ with tab3:
                         key=f"btn_dl_{safe}",
                     )
 
-            emoji = "🎓" if mode_key == "scholarship" else "💼"
+            emoji = MODE_ICONS.get(mode, "✨")
             st.success(
                 f"**Step 3 complete!** {len(st.session_state.drafts)} draft(s) ready. "
                 f"Review and personalize each one before submitting. Good luck! {emoji}"

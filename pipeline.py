@@ -9,16 +9,18 @@ from urllib.parse import urlparse
 import socket
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from ai_scraper import extract_scholarship_data, extract_internship_data
+from ai_scraper import extract_scholarship_data, extract_internship_data, extract_job_data
 
 _EXTRACT_FNS = {
     "scholarship": extract_scholarship_data,
     "internship":  extract_internship_data,
+    "job":         extract_job_data,
 }
 
 _DATA_KEYS = {
     "scholarship": "scholarships",
     "internship":  "internships",
+    "job":         "jobs",
 }
 
 
@@ -140,7 +142,7 @@ def run_pipeline(
 
     Args:
         urls:              List of URLs to scrape.
-        mode:              "scholarship" or "internship".
+        mode:              "scholarship", "internship", or "job".
         progress_callback: Optional callable invoked after each URL is processed.
     Returns:
         A pandas DataFrame of active listings (may be empty).
