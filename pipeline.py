@@ -205,14 +205,27 @@ def is_listing_active(item: dict) -> bool:
 
 
 def _normalize_apply_url(item: dict, scout_url: str) -> dict:
-    """Prefer an extracted apply/detail URL when present and safe."""
+    """Prefer an extracted apply/detail URL when present and safe; else keep source for drafting."""
     item["source_url"] = scout_url
     apply = str(item.get("apply_url") or "").strip()
     if apply.startswith("http") and _is_safe_url(apply):
         item["apply_url"] = apply
     else:
-        item["apply_url"] = ""
+        # Fall back to the scouted page so drafts still have a link target.
+        item["apply_url"] = scout_url if scout_url.startswith("http") else ""
     return item
+
+
+def empty_pipeline_stats() -> dict:
+    return {
+        "urls_total": 0,
+        "fetched": 0,
+        "fetch_failed": 0,
+        "extracted": 0,
+        "validation_dropped": 0,
+        "deadline_filtered": 0,
+        "active": 0,
+    }
 
 
 def run_pipeline(
@@ -222,21 +235,21 @@ def run_pipeline(
     provider: str = "Gemini",
     api_key: str = None,
     ollama_host: str = None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
     """
     Fetches each URL, extracts listings via LLM, filters out inactive
-    ones, and returns the results as a DataFrame (in-memory only).
+    ones, and returns (DataFrame, stats).
 
-    Args:
-        urls:              List of URLs to scrape.
-        mode:              "scholarship", "internship", or "job".
-        progress_callback: Optional callable invoked after each URL is processed.
-    Returns:
-        A pandas DataFrame of active listings (may be empty).
+    Stats keys: urls_total, fetched, fetch_failed, extracted,
+    validation_dropped, deadline_filtered, active.
+
+    progress_callback may receive optional kwargs: stats=dict, done=bool.
     """
     data_key = _DATA_KEYS[mode]
     all_items = []
     total = len(urls)
+    stats = empty_pipeline_stats()
+    stats["urls_total"] = total
 
     for i, url in enumerate(urls):
         if progress_callback:
@@ -245,22 +258,30 @@ def run_pipeline(
                 site_num=i + 1,
                 total_sites=total,
                 found_so_far=len(all_items),
+                stats=dict(stats),
             )
 
         html_content = fetch_and_clean_html(url)
 
         if not html_content:
+            stats["fetch_failed"] += 1
             print(f"  -> Skipping {url} (fetch failed)")
             continue
 
+        stats["fetched"] += 1
         print(f"  -> Sending to {provider}...")
         time.sleep(1)
 
         try:
-            data       = _extract_with_retry(html_content, mode=mode, provider=provider, api_key=api_key, ollama_host=ollama_host)
+            data = _extract_with_retry(
+                html_content, mode=mode, provider=provider, api_key=api_key, ollama_host=ollama_host,
+            )
             found_list = data.get(data_key, [])
+            extract_stats = data.get("_stats") or {}
+            stats["extracted"] += int(extract_stats.get("coerced", len(found_list)))
+            stats["validation_dropped"] += int(extract_stats.get("validation_dropped", 0))
 
-            active   = 0
+            active = 0
             inactive = 0
             for item in found_list:
                 item = _normalize_apply_url(item, url)
@@ -270,10 +291,20 @@ def run_pipeline(
                 else:
                     inactive += 1
 
-            print(f"  -> {active} active, {inactive} filtered as closed/expired")
+            stats["deadline_filtered"] += inactive
+            stats["active"] = len(all_items)
+            print(
+                f"  -> {active} active, {inactive} deadline-filtered "
+                f"(extract kept {extract_stats.get('coerced', len(found_list))}, "
+                f"dropped {extract_stats.get('validation_dropped', 0)})"
+            )
 
         except Exception as e:
+            # Treat hard extract failures as validation drops for UI explainability.
+            stats["validation_dropped"] += 1
             print(f"  -> Error processing {url}: {e}")
+
+    stats["active"] = len(all_items)
 
     if progress_callback and urls:
         progress_callback(
@@ -281,6 +312,7 @@ def run_pipeline(
             site_num=total,
             total_sites=total,
             found_so_far=len(all_items),
+            stats=dict(stats),
             done=True,
         )
 
@@ -288,20 +320,35 @@ def run_pipeline(
         df = pd.DataFrame(all_items)
         df = df.fillna("")
         print(f"\n--- Session Results: {len(df)} active {mode}s ---")
-        return df
+        print(
+            f"    stats: fetched={stats['fetched']}/{stats['urls_total']} "
+            f"extracted={stats['extracted']} "
+            f"validation_dropped={stats['validation_dropped']} "
+            f"deadline_filtered={stats['deadline_filtered']}"
+        )
+        return df, stats
 
     print(f"\nNo active {mode}s found.")
-    return pd.DataFrame()
+    print(
+        f"    stats: fetched={stats['fetched']}/{stats['urls_total']} "
+        f"extracted={stats['extracted']} "
+        f"validation_dropped={stats['validation_dropped']} "
+        f"deadline_filtered={stats['deadline_filtered']}"
+    )
+    return pd.DataFrame(), stats
 
 
 # Backward-compatible alias
 def run_scholarship_pipeline(urls, progress_callback=None, provider="Gemini", api_key=None, ollama_host=None):
-    return run_pipeline(urls, mode="scholarship", progress_callback=progress_callback,
-                        provider=provider, api_key=api_key, ollama_host=ollama_host)
+    df, _stats = run_pipeline(
+        urls, mode="scholarship", progress_callback=progress_callback,
+        provider=provider, api_key=api_key, ollama_host=ollama_host,
+    )
+    return df
 
 
 if __name__ == "__main__":
     target_urls = [
         "https://www.careeronestop.org/Toolkit/Training/find-scholarships.aspx?keyword=data%20science&sortcolumns=BestMatch&sortdirections=Descending&p=1",
     ]
-    run_pipeline(target_urls, mode="scholarship")
+    run_pipeline(target_urls, mode="scholarship")  # returns (df, stats)

@@ -1,4 +1,5 @@
 import json
+import re
 from dotenv import load_dotenv
 
 from llm import call_llm
@@ -48,8 +49,161 @@ JOB_REQUIRED_FIELDS = {
 }
 
 
+def _as_str(value, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return default
+
+
+def _as_list(value) -> list:
+    """Coerce strings / scalars into a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out = []
+        for v in value:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                out.append(s)
+        return out
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        # Split common delimiters; keep single token otherwise.
+        if any(d in text for d in (",", ";", "|", "/")):
+            parts = re.split(r"[,;/|]+", text)
+            return [p.strip() for p in parts if p.strip()]
+        return [text]
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    return []
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "yes", "y", "1", "paid"):
+            return True
+        if low in ("false", "no", "n", "0", "unpaid", ""):
+            return False
+    return default
+
+
+def _as_number_or_none(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        m = re.search(r"(\d+(?:\.\d+)?)", text)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _coerce_scholarship(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    out = {
+        "name": _as_str(item.get("name")),
+        "amount": _as_number_or_none(item.get("amount")),
+        "deadline": _as_str(item.get("deadline")),
+        "min_gpa": _as_number_or_none(item.get("min_gpa")),
+        "majors": _as_list(item.get("majors")),
+        "eligible_states": _as_list(item.get("eligible_states")),
+        "ethnicity": _as_str(item.get("ethnicity")),
+        "first_gen": _as_bool(item.get("first_gen"), False),
+        "income_based": _as_bool(item.get("income_based"), False),
+        "description": _as_str(item.get("description")),
+        "apply_url": _as_str(item.get("apply_url")),
+    }
+    # Survival: need a name plus description or apply_url.
+    if not out["name"]:
+        return None
+    if not (out["description"] or out["apply_url"]):
+        return None
+    if len(out["name"]) > 300:
+        return None
+    return out
+
+
+def _coerce_internship(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    out = {
+        "company": _as_str(item.get("company")),
+        "role": _as_str(item.get("role")),
+        "location": _as_str(item.get("location")),
+        "required_skills": _as_list(item.get("required_skills")),
+        "preferred_majors": _as_list(item.get("preferred_majors")),
+        "min_gpa": _as_number_or_none(item.get("min_gpa")),
+        "class_year": _as_list(item.get("class_year")),
+        "paid": _as_bool(item.get("paid"), False),
+        "compensation": _as_str(item.get("compensation")),
+        "deadline": _as_str(item.get("deadline")),
+        "start_date": _as_str(item.get("start_date")),
+        "duration": _as_str(item.get("duration")),
+        "description": _as_str(item.get("description")),
+        "apply_url": _as_str(item.get("apply_url")),
+    }
+    # Survival: company + role and (description or apply_url).
+    if not out["company"] or not out["role"]:
+        return None
+    if not (out["description"] or out["apply_url"]):
+        return None
+    if len(out["company"]) > 300:
+        return None
+    return out
+
+
+def _coerce_job(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    out = {
+        "company": _as_str(item.get("company")),
+        "role": _as_str(item.get("role")),
+        "location": _as_str(item.get("location")),
+        "required_skills": _as_list(item.get("required_skills")),
+        "preferred_majors": _as_list(item.get("preferred_majors")),
+        "min_gpa": _as_number_or_none(item.get("min_gpa")),
+        "experience_level": _as_list(item.get("experience_level")),
+        "employment_type": _as_str(item.get("employment_type")),
+        "compensation": _as_str(item.get("compensation")),
+        "deadline": _as_str(item.get("deadline")),
+        "description": _as_str(item.get("description")),
+        "apply_url": _as_str(item.get("apply_url")),
+    }
+    # Survival: company + role and (description or apply_url).
+    if not out["company"] or not out["role"]:
+        return None
+    if not (out["description"] or out["apply_url"]):
+        return None
+    if len(out["company"]) > 300:
+        return None
+    return out
+
+
 def _validate(item: dict, schema: dict) -> bool:
-    """Reject entries that don't match the expected schema."""
+    """Type-check after coercion (all keys present with correct types)."""
     if not isinstance(item, dict):
         return False
     for field, expected in schema.items():
@@ -61,45 +215,61 @@ def _validate(item: dict, schema: dict) -> bool:
 
 
 def _validate_scholarship(item: dict) -> bool:
-    if not _validate(item, SCHOLARSHIP_REQUIRED_FIELDS):
-        return False
-    if isinstance(item.get("name"), str) and len(item["name"]) > 300:
-        return False
-    return True
+    return _validate(item, SCHOLARSHIP_REQUIRED_FIELDS)
 
 
 def _validate_internship(item: dict) -> bool:
-    if not _validate(item, INTERNSHIP_REQUIRED_FIELDS):
-        return False
-    if isinstance(item.get("company"), str) and len(item["company"]) > 300:
-        return False
-    return True
+    return _validate(item, INTERNSHIP_REQUIRED_FIELDS)
 
 
 def _validate_job(item: dict) -> bool:
-    if not _validate(item, JOB_REQUIRED_FIELDS):
-        return False
-    if isinstance(item.get("company"), str) and len(item["company"]) > 300:
-        return False
-    return True
+    return _validate(item, JOB_REQUIRED_FIELDS)
 
 
-def _extract_and_parse(prompt: str, key: str, validator, provider, api_key, ollama_host):
-    """Shared extraction logic: call LLM, parse JSON, validate items."""
+def _extract_and_parse(prompt: str, key: str, coerce_fn, validator, provider, api_key, ollama_host):
+    """
+    Shared extraction: call LLM, parse JSON, coerce each item, then validate.
+    Returns {key: [...], "_stats": {raw, coerced, validation_dropped}}.
+    Coercion uses a survival rule so multi-job pages keep multiple listings.
+    """
+    empty = {key: [], "_stats": {"raw": 0, "coerced": 0, "validation_dropped": 0}}
     try:
         raw = call_llm(prompt, provider=provider, api_key=api_key, ollama_host=ollama_host)
         clean_json_text = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_json_text)
 
         if not isinstance(data, dict) or key not in data:
-            return {key: []}
+            return empty
 
-        data[key] = [item for item in data[key] if validator(item)]
-        return data
+        raw_items = data.get(key) or []
+        if not isinstance(raw_items, list):
+            return empty
+
+        kept = []
+        validation_dropped = 0
+        for item in raw_items:
+            coerced = coerce_fn(item)
+            if coerced is None:
+                validation_dropped += 1
+                continue
+            if not validator(coerced):
+                # Coercion should always produce schema-shaped dicts; count as drop if not.
+                validation_dropped += 1
+                continue
+            kept.append(coerced)
+
+        return {
+            key: kept,
+            "_stats": {
+                "raw": len(raw_items),
+                "coerced": len(kept),
+                "validation_dropped": validation_dropped,
+            },
+        }
 
     except Exception as e:
         print(f"Error extracting data: {e}")
-        return {key: []}
+        return empty
 
 
 # ── Scholarship extraction ────────────────────────────────────────────────────
@@ -152,7 +322,10 @@ def extract_scholarship_data(html_snippet, provider: str = "Gemini", api_key: st
         '    ]\n'
         '}\n'
     )
-    return _extract_and_parse(prompt, "scholarships", _validate_scholarship, provider, api_key, ollama_host)
+    return _extract_and_parse(
+        prompt, "scholarships", _coerce_scholarship, _validate_scholarship,
+        provider, api_key, ollama_host,
+    )
 
 
 # ── Internship extraction ─────────────────────────────────────────────────────
@@ -168,6 +341,7 @@ def extract_internship_data(html_snippet, provider: str = "Gemini", api_key: str
         "</user_html>\n\n"
         "Return ONLY a raw JSON object (no markdown) with a single key \"internships\" "
         "that is a list of objects.\n"
+        "If the page is a multi-role listing hub, return EVERY distinct internship as its own object.\n"
         "For each internship, extract every field you can find.\n"
         "IMPORTANT: empty list/string = unknown (not mentioned). "
         'Use ["ALL"] only when the page explicitly says open to all majors/years.\n'
@@ -210,7 +384,10 @@ def extract_internship_data(html_snippet, provider: str = "Gemini", api_key: str
         '    ]\n'
         '}\n'
     )
-    return _extract_and_parse(prompt, "internships", _validate_internship, provider, api_key, ollama_host)
+    return _extract_and_parse(
+        prompt, "internships", _coerce_internship, _validate_internship,
+        provider, api_key, ollama_host,
+    )
 
 
 # ── Job extraction ────────────────────────────────────────────────────────────
@@ -226,6 +403,7 @@ def extract_job_data(html_snippet, provider: str = "Gemini", api_key: str = None
         "</user_html>\n\n"
         "Return ONLY a raw JSON object (no markdown) with a single key \"jobs\" "
         "that is a list of objects.\n"
+        "If the page is a multi-role listing hub, return EVERY distinct job as its own object.\n"
         "For each job, extract every field you can find.\n"
         "IMPORTANT: empty list/string = unknown (not mentioned). "
         'Use ["ALL"] only when the page explicitly says open to all majors/levels.\n'
@@ -265,7 +443,10 @@ def extract_job_data(html_snippet, provider: str = "Gemini", api_key: str = None
         '    ]\n'
         '}\n'
     )
-    return _extract_and_parse(prompt, "jobs", _validate_job, provider, api_key, ollama_host)
+    return _extract_and_parse(
+        prompt, "jobs", _coerce_job, _validate_job,
+        provider, api_key, ollama_host,
+    )
 
 
 if __name__ == "__main__":

@@ -12,36 +12,49 @@ Built with Python, Streamlit, BeautifulSoup, and your choice of AI provider.
 
 | Step | What Happens |
 |---|---|
-| **Scout** | Runs multiple targeted searches via DuckDuckGo based on your profile and mode, deduplicates URLs across all queries |
-| **Extract** | Fetches each page, strips JS/CSS to reduce tokens, sends clean HTML to your chosen AI for structured JSON extraction |
-| **Filter** | Multi-axis Pandas filtering against your profile. Expired listings are dropped automatically by deadline parsing |
-| **Draft** | Re-fetches each match's live page and uses RAG to write a personalized cover letter grounded in your uploaded resume |
+| **Profile** | Enter role/field (career) or eligibility (scholarship) plus resume in the main panel |
+| **Find** | Board-first DuckDuckGo `site:` search for jobs/internships (LinkedIn, Indeed, Greenhouse, Lever, Ashby, Workday, Simplify, Handshake…); scholarships stay open-web |
+| **Extract** | Fetches each page, coerces LLM JSON into durable listings (company + role + description/apply URL), logs drop reasons |
+| **Filter** | Multi-axis Pandas filtering against your profile. Expired listings are dropped by deadline parsing |
+| **Draft** | Re-fetches each match's apply/detail page and uses RAG to write a personalized cover letter grounded in your resume |
 
 ---
 
 ## Modes
 
-An **I want** control at the top of the sidebar switches the entire app between **Job**, **Internship**, and **Scholarship**. Career modes come first; Scholarship remains available. Each mode adapts the full pipeline:
+**Sidebar** switches mode (**Job** / **Internship** / **Scholarship**) and holds AI provider + key plus advanced scout budget. **Main panel** is the product loop: profile → resume → Find → Matches → Drafts.
 
 | | Scholarship | Internship | Job |
 |---|---|---|---|
 | **Branding** | CoScholar AI | CoIntern AI | CoJobs AI |
-| **Profile fields** | Major, GPA, state, ethnicity, first-gen, income-based | Major, GPA, state, desired role, location preference, class year | Major, GPA, state, desired role, location preference, experience level |
-| **Search queries** | Major-specific, state-based, demographic, need-based | Role-specific, major-based, location-based, class-year | Role-specific, field-based, location-based, experience-level |
-| **Extraction schema** | Name, amount, deadline, GPA, majors, states, ethnicity, first-gen, income-based | Company, role, location, skills, majors, GPA, class year, paid, compensation, deadline | Company, role, location, skills, majors, GPA, experience level, employment type, compensation, deadline |
-| **Matching logic** | GPA, major, state, ethnicity, first-gen, income | GPA, major, location preference, class year | GPA, major, location preference, experience level |
-| **Cover letter tone** | Scholarship applicant — mission alignment, community impact | Internship candidate — skills, projects, company connection | Job candidate — impact, ownership, day-one readiness |
-| **Database** | `scholarship_database.csv` | `internship_database.csv` | `job_database.csv` |
+| **Primary drivers** | Major + GPA | Desired role + field | Desired role + field |
+| **GPA** | Required | Optional | Optional |
+| **Search** | Open-web eligibility angles | Board-first + small open-web fallback | Board-first + small open-web fallback |
+| **Extraction** | Coerce + keep if name + description/apply | Coerce + keep if company + role + description/apply | Same as internship |
+| **Matching** | GPA, major, state, ethnicity, first-gen, income | Role, field, location, class year | Role, field, location, experience |
+| **Cover letter tone** | Mission / community impact | Skills, projects, company fit | Impact, ownership, day-one readiness |
 
 Switching modes clears the current session data so results from different targets don't mix.
 
+### Board-first career discovery
+
+Job and Internship modes prefer `site:` queries for:
+
+- linkedin.com/jobs, indeed.com, glassdoor.com, wellfound.com
+- greenhouse.io, lever.co / jobs.lever.co, ashbyhq.com
+- Public Workday (`myworkdayjobs.com` / jobs paths)
+- simplify.jobs; Handshake (internships)
+
+URLs are ranked so board/ATS domains win; Reddit/blogs/news are demoted. Total unique URLs stay capped around **24**, with budget spent on board hits first and slightly deeper depth on board angles.
+
 ### Matching & drafting quality
 
-- Search years follow the current calendar (and next year in fall recruiting) — not a hardcoded `2026`.
+- Search years follow the current calendar (and next year in fall recruiting).
 - Fetches follow safe redirects and prefer `main`/`article` content with a larger HTML window.
-- Extractors can return an `apply_url`; cover letters ground on that page when present, plus structured listing facts and sidebar profile (including Name for sign-off).
+- Extractors coerce types (strings→lists, parse `min_gpa`) and **do not** require every schema field to be perfectly typed — survival needs company + role and a description or apply URL.
+- Per-URL stats (`fetched` / `extracted` / `validation_dropped` / `deadline_filtered`) surface in the Find status so “0 active” is explainable.
+- Extractors can return an `apply_url`; when missing, the scouted page is kept as a fallback link for drafting.
 - Matches are scored and sorted (role fit, explicit major hits, apply URL, description). Empty eligibility is treated as **unknown** (soft-pass, lower rank), not “open to all.”
-- Internship/job filters use desired role; On-site means not Remote/Hybrid; Remote + states uses AND.
 
 ---
 
@@ -53,7 +66,7 @@ Switching modes clears the current session data so results from different target
 | LLM | Gemini, Claude, OpenAI, or Ollama (your choice) |
 | Web Search | DuckDuckGo |
 | Scraping | BeautifulSoup4, Requests |
-| Data | Pandas — CSV flat-file persistence |
+| Data | Pandas — in-memory session results |
 | Resume Parsing | pdfplumber |
 | Env Management | python-dotenv |
 
@@ -103,6 +116,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+### Profile steps (main panel)
+
+1. Pick **Job**, **Internship**, or **Scholarship** in the sidebar (plus AI key).
+2. Fill **You**: name, role + field (career) or major + GPA (scholarship), location / experience or class year, resume upload or paste.
+3. Click **Find jobs** / **Find internships** / **Find scholarships** and watch status counters if results are empty.
+4. Review **Matches**, then **Drafts** for top-N cover letters.
+
 ---
 
 ## Project Structure
@@ -111,12 +131,12 @@ streamlit run app.py
 coscholar/
 ├── .streamlit/
 │   └── config.toml      # Dark theme config
-├── app.py               # Streamlit UI, mode toggle, filtering logic (all modes)
-├── agent.py             # Multi-query web discovery — scholarship, internship & job queries
+├── app.py               # Streamlit UI — sidebar controls + main profile/Find loop
+├── agent.py             # Board-first job/internship discovery; open-web scholarships
 ├── llm.py               # Unified AI provider interface (Gemini/Claude/OpenAI/Ollama)
-├── pipeline.py          # HTML fetch, clean, SSRF validation, mode-aware orchestration
-├── ai_scraper.py        # AI-based structured extraction — scholarship, internship & job schemas
-├── drafter.py           # RAG cover letter generation — scholarship, internship & job prompts
+├── pipeline.py          # HTML fetch, clean, SSRF validation, stats-aware orchestration
+├── ai_scraper.py        # Coerce + extract scholarship / internship / job schemas
+├── drafter.py           # RAG cover letter generation
 └── requirements.txt
 ```
 
@@ -135,8 +155,8 @@ coscholar/
 ## Notes
 
 - Works best on static HTML pages. JavaScript-heavy SPAs (React/Angular) return limited results.
-- Each mode persists its own database locally (`scholarship_database.csv` / `internship_database.csv` / `job_database.csv`) and auto-loads on browser refresh.
+- Session results stay in browser memory for the current mode; switching modes clears them.
 - AI calls use exponential backoff retry (via `tenacity`) to handle rate limits gracefully.
-- Filtering logic lives in `app.py` (`filter_scholarship_matches()`, `filter_internship_matches()`, and `filter_job_matches()`). It runs on scout completion and reactively as you update your profile in the sidebar.
-- Each draft includes an "Apply here" link to the original source URL so you know where to submit your application.
-- The Matches and Scout tables show clickable "Visit" links for every listing's source page.
+- Filtering logic lives in `app.py` (`filter_scholarship_matches()`, `filter_internship_matches()`, and `filter_job_matches()`).
+- Each draft includes an "Apply here" link (preferring extracted `apply_url`) so you know where to submit.
+- The Matches and Find tables show clickable Visit/Apply links for every listing.

@@ -219,6 +219,9 @@ def _location_mask(loc_col: pd.Series, location_pref: str, states: list[str]) ->
 
 
 def _gpa_mask(df: pd.DataFrame, gpa: float) -> pd.Series:
+    """When gpa <= 0 (optional / unset), do not hard-filter on min_gpa."""
+    if gpa is None or gpa <= 0:
+        return pd.Series([True] * len(df), index=df.index)
     gpa_col = pd.to_numeric(df.get("min_gpa", pd.Series(index=df.index)), errors="coerce")
     # Missing requirement → pass; explicit requirement must be <= user GPA.
     return gpa_col.isna() | (gpa_col <= gpa)
@@ -356,8 +359,12 @@ def filter_internship_matches(
 
     gpa_mask = _gpa_mask(df, gpa)
 
-    major_col = _col(df, "preferred_majors")
-    major_mask, _ = _field_match_mask(major_col, major_terms(major), allow_unknown=True)
+    # Field optional for career — skip hard major filter when unset.
+    if (major or "").strip():
+        major_col = _col(df, "preferred_majors")
+        major_mask, _ = _field_match_mask(major_col, major_terms(major), allow_unknown=True)
+    else:
+        major_mask = pd.Series([True] * len(df), index=df.index)
 
     location_mask = _location_mask(_col(df, "location"), location_pref, states)
 
@@ -387,8 +394,11 @@ def filter_job_matches(
 
     gpa_mask = _gpa_mask(df, gpa)
 
-    major_col = _col(df, "preferred_majors")
-    major_mask, _ = _field_match_mask(major_col, major_terms(major), allow_unknown=True)
+    if (major or "").strip():
+        major_col = _col(df, "preferred_majors")
+        major_mask, _ = _field_match_mask(major_col, major_terms(major), allow_unknown=True)
+    else:
+        major_mask = pd.Series([True] * len(df), index=df.index)
 
     location_mask = _location_mask(_col(df, "location"), location_pref, states)
 
@@ -413,6 +423,7 @@ for key, default in [
     ("is_scouting",     False),
     ("is_drafting",     False),
     ("scout_done",      False),
+    ("scout_stats",     None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -420,15 +431,76 @@ for key, default in [
     if key == "mode" and st.session_state[key] not in MODES:
         st.session_state[key] = DEFAULT_MODE
 
+MAX_FILE_SIZE = 5 * 1024 * 1024
+PDF_MAGIC = b"%PDF"
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+FIND_LABELS = {
+    "job": "Find jobs",
+    "internship": "Find internships",
+    "scholarship": "Find scholarships",
+}
+
+
+def _parse_resume_uploads(uploaded_files) -> str:
+    if "uploaded_file_cache" not in st.session_state:
+        st.session_state.uploaded_file_cache = {}
+
+    uploaded_text = ""
+    for f in uploaded_files or []:
+        cache_key = f"{f.name}_{f.size}"
+
+        if cache_key in st.session_state.uploaded_file_cache:
+            uploaded_text += st.session_state.uploaded_file_cache[cache_key] + "\n\n"
+            st.success(f"✅ {f.name}")
+            continue
+
+        if f.size > MAX_FILE_SIZE:
+            st.warning(f"⚠️ {f.name} exceeds 5 MB limit — skipped.")
+            continue
+
+        raw_bytes = f.read()
+
+        if f.type == "text/plain":
+            text = raw_bytes.decode("utf-8", errors="ignore")
+            st.session_state.uploaded_file_cache[cache_key] = text
+            uploaded_text += text + "\n\n"
+            st.success(f"✅ {f.name}")
+        elif f.type == "application/pdf":
+            if not raw_bytes[:4].startswith(PDF_MAGIC):
+                st.warning(f"⚠️ {f.name} doesn't appear to be a valid PDF — skipped.")
+                continue
+            try:
+                with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                    text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+                st.session_state.uploaded_file_cache[cache_key] = text
+                uploaded_text += text + "\n\n"
+                st.success(f"✅ {f.name}")
+            except Exception as e:
+                st.warning(f"PDF parse error ({f.name}): {e}")
+    return uploaded_text
+
+
+def _format_drop_reasons(stats: dict | None, mode_noun: str) -> str:
+    if not stats:
+        return f"No active {mode_noun} found."
+    parts = [
+        f"**{stats.get('urls_total', 0)}** URLs scraped",
+        f"**{stats.get('fetched', 0)}** fetched",
+        f"**{stats.get('fetch_failed', 0)}** fetch failed",
+        f"**{stats.get('extracted', 0)}** extracted",
+        f"**{stats.get('validation_dropped', 0)}** failed extract/validation",
+        f"**{stats.get('deadline_filtered', 0)}** failed deadline",
+        f"**{stats.get('active', 0)}** active",
+    ]
+    return " · ".join(parts)
+
+
+# ── Sidebar — session controls only ───────────────────────────────────────────
 with st.sidebar:
     st.markdown("## CoScholar")
-    st.caption("Find a job or internship → match your profile → draft a cover letter.")
-    st.caption("Results stay in this browser session only.")
+    st.caption("Session controls. Profile and Find live in the main panel.")
     st.divider()
 
-    # Mode toggle — Jobs & Internships first; Scholarship still available.
     st.markdown('<div class="slabel">I want</div>', unsafe_allow_html=True)
     mode_index = MODES.index(st.session_state.mode) if st.session_state.mode in MODES else 0
     new_mode = st.radio(
@@ -437,7 +509,7 @@ with st.sidebar:
         index=mode_index,
         horizontal=True,
         label_visibility="collapsed",
-        help="Jobs and Internships share the career pipeline. Scholarship keeps the funding flow.",
+        help="Jobs and Internships use board-first search. Scholarship keeps open-web discovery.",
     )
     if new_mode != st.session_state.mode:
         st.session_state.mode = new_mode
@@ -445,16 +517,16 @@ with st.sidebar:
         st.session_state.matches_df  = None
         st.session_state.drafts      = {}
         st.session_state.scout_done  = False
+        st.session_state.scout_stats = None
         load_csv.clear()
         st.rerun()
 
     mode = st.session_state.mode
-    mode_key = MODE_KEYS[mode]  # "scholarship", "internship", or "job"
+    mode_key = MODE_KEYS[mode]
     mode_noun = MODE_NOUNS[mode_key]
 
     st.divider()
 
-    # Provider + API key
     st.markdown('<div class="slabel">AI Provider</div>', unsafe_allow_html=True)
     provider = st.selectbox(
         "AI Provider",
@@ -494,55 +566,234 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Profile (mode-dependent) ─────────────────────────────────────────────
-    st.markdown('<div class="slabel">Your profile</div>', unsafe_allow_html=True)
-    name  = st.text_input("Full Name", placeholder="Jane Smith", max_chars=100,
-                          help="Used in cover-letter sign-off. Optional for search.")
-    major = st.text_input("Major / Field", placeholder="Computer Science", max_chars=100)
-    gpa   = st.number_input("GPA", min_value=0.0, max_value=5.0, step=0.1, format="%.1f",
-                            help="Supports 4.0 and 5.0 scales.")
-    states = st.multiselect("States (2-letter)", options=US_STATES, default=[], placeholder="Select one or more states")
-    states = [s.upper() for s in states]
-    primary_state = states[0] if states else ""
+    with st.expander("Advanced scout budget", expanded=False):
+        max_results = st.slider(
+            "Results per search angle",
+            1, 10, 5,
+            help=(
+                "Board site: queries use a slightly deeper depth. "
+                "Total unique URLs are capped around 24; board/ATS hits are kept first."
+            ),
+        )
+
+    st.divider()
+    if st.session_state.listings_df is not None:
+        count = len(st.session_state.listings_df)
+        st.markdown(
+            f'<div class="status-loaded">📂 Session results<br>'
+            f'<span style="opacity:0.7">{count} {mode_noun} in this browser session</span></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("🔁 Reset Session Data", use_container_width=True, key="btn_reset_session"):
+            st.session_state.listings_df = None
+            st.session_state.matches_df  = None
+            st.session_state.drafts      = {}
+            st.session_state.scout_done  = False
+            st.session_state.scout_stats = None
+            load_csv.clear()
+            st.rerun()
+    else:
+        st.caption(f"No {mode_noun} yet. Fill your profile and run Find.")
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
+title_col, pill_col = st.columns([5, 1])
+with title_col:
+    st.markdown(f"# {MODE_TITLES[mode]}")
+    st.caption(MODE_SUBTITLES[mode])
+with pill_col:
+    if st.session_state.listings_df is not None:
+        n = len(st.session_state.listings_df)
+        st.markdown(
+            f'<div style="text-align:right;padding-top:1.25rem">'
+            f'<span class="tag">🗄 {n} in DB</span></div>',
+            unsafe_allow_html=True,
+        )
+
+st.divider()
+
+_ENV_KEYS = {
+    "Gemini": os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY") or "",
+    "Claude": os.getenv("ANTHROPIC_API_KEY") or "",
+    "OpenAI": os.getenv("OPENAI_API_KEY") or "",
+    "Ollama": "",
+}
+active_api_key = user_api_key or _ENV_KEYS.get(provider, "") or ""
+api_key_set    = (provider == "Ollama") or bool(active_api_key)
+_is_career_mode = mode_key in ("internship", "job")
+_name_col = "name" if mode_key == "scholarship" else "company"
+
+tab1, tab2, tab3 = st.tabs(["  🔍  Find  ", "  📋  Matches  ", "  ✏️  Drafts  "])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 1 — PROFILE + FIND
+# ─────────────────────────────────────────────────────────────────────────────
+with tab1:
+    st.markdown('<div class="tag">Step 01 · Goal</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="step-title">{MODE_ICONS[mode]} Looking for {mode_noun}</div>',
+        unsafe_allow_html=True,
+    )
+    if _is_career_mode:
+        st.markdown(
+            '<div class="step-sub">Board-first search across LinkedIn, Indeed, Greenhouse, '
+            "Lever, Ashby, Workday, and more — then AI extraction and ranking.</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="step-sub">Open-web scholarship discovery matched to your eligibility.</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div class="tag">Step 02 · You</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-title">Your profile</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="step-sub">Role and field drive career search. Add a resume before drafting.</div>',
+        unsafe_allow_html=True,
+    )
+
+    name = st.text_input(
+        "Full Name",
+        placeholder="Jane Smith",
+        max_chars=100,
+        help="Used in cover-letter sign-off. Optional for search.",
+        key="profile_name",
+    )
 
     if mode_key == "scholarship":
-        ethnicity    = st.text_input("Ethnicity (optional)", placeholder="e.g. Hispanic, Black, Asian, white", max_chars=50)
-        first_gen    = st.checkbox("First-generation college student")
-        income_based = st.checkbox("Financial need / income-based")
         desired_role = ""
         location_pref = "Any"
         class_year = ""
         experience_level = ""
+        major = st.text_input("Major / Field", placeholder="Computer Science", max_chars=100, key="profile_major")
+        gpa = st.number_input(
+            "GPA", min_value=0.0, max_value=5.0, step=0.1, format="%.1f",
+            help="Required for scholarship matching.",
+            key="profile_gpa",
+        )
+        states = st.multiselect(
+            "States (2-letter)", options=US_STATES, default=[],
+            placeholder="Select one or more states", key="profile_states",
+        )
+        ethnicity = st.text_input(
+            "Ethnicity (optional)", placeholder="e.g. Hispanic, Black, Asian, white",
+            max_chars=50, key="profile_ethnicity",
+        )
+        first_gen = st.checkbox("First-generation college student", key="profile_first_gen")
+        income_based = st.checkbox("Financial need / income-based", key="profile_income")
     elif mode_key == "internship":
         ethnicity = ""
         first_gen = False
         income_based = False
         experience_level = ""
-        desired_role  = st.text_input("Desired Role / Title", placeholder="Software Engineering Intern", max_chars=100)
-        location_pref = st.selectbox(
-            "Location Preference",
-            ["Any", "Remote", "Hybrid", "On-site"],
-            help="On-site means not Remote/Hybrid. Remote + states requires both.",
+        c_role, c_field = st.columns(2)
+        with c_role:
+            desired_role = st.text_input(
+                "Desired Role / Title", placeholder="Software Engineering Intern",
+                max_chars=100, key="profile_role",
+            )
+        with c_field:
+            major = st.text_input(
+                "Major / Field", placeholder="Computer Science",
+                max_chars=100, key="profile_major",
+            )
+        c_loc, c_year = st.columns(2)
+        with c_loc:
+            location_pref = st.selectbox(
+                "Location Preference",
+                ["Any", "Remote", "Hybrid", "On-site"],
+                help="On-site means not Remote/Hybrid. Remote + states requires both.",
+                key="profile_loc",
+            )
+        with c_year:
+            class_year = st.selectbox(
+                "Class Year", ["", "Freshman", "Sophomore", "Junior", "Senior"],
+                key="profile_class_year",
+            )
+        states = st.multiselect(
+            "States (2-letter)", options=US_STATES, default=[],
+            placeholder="Optional — refine location", key="profile_states",
         )
-        class_year    = st.selectbox("Class Year", ["", "Freshman", "Sophomore", "Junior", "Senior"])
+        gpa = st.number_input(
+            "GPA (optional)", min_value=0.0, max_value=5.0, step=0.1, format="%.1f",
+            help="Optional for internships — used for soft ranking when provided.",
+            key="profile_gpa",
+        )
     else:  # job
         ethnicity = ""
         first_gen = False
         income_based = False
         class_year = ""
-        desired_role  = st.text_input("Desired Role / Title", placeholder="Software Engineer", max_chars=100)
-        location_pref = st.selectbox(
-            "Location Preference",
-            ["Any", "Remote", "Hybrid", "On-site"],
-            help="On-site means not Remote/Hybrid. Remote + states requires both.",
+        c_role, c_field = st.columns(2)
+        with c_role:
+            desired_role = st.text_input(
+                "Desired Role / Title", placeholder="Data Analyst",
+                max_chars=100, key="profile_role",
+            )
+        with c_field:
+            major = st.text_input(
+                "Field / Background", placeholder="Data Science",
+                max_chars=100, key="profile_major",
+            )
+        c_loc, c_exp = st.columns(2)
+        with c_loc:
+            location_pref = st.selectbox(
+                "Location Preference",
+                ["Any", "Remote", "Hybrid", "On-site"],
+                help="On-site means not Remote/Hybrid. Remote + states requires both.",
+                key="profile_loc",
+            )
+        with c_exp:
+            experience_level = st.selectbox(
+                "Experience Level",
+                ["", "Entry-level", "New Grad", "Mid-level", "Senior"],
+                key="profile_experience",
+            )
+        states = st.multiselect(
+            "States (2-letter)", options=US_STATES, default=[],
+            placeholder="Optional — refine location", key="profile_states",
         )
-        experience_level = st.selectbox(
-            "Experience Level",
-            ["", "Entry-level", "New Grad", "Mid-level", "Senior"],
+        gpa = st.number_input(
+            "GPA (optional)", min_value=0.0, max_value=5.0, step=0.1, format="%.1f",
+            help="Optional for jobs — used for soft ranking when provided.",
+            key="profile_gpa",
         )
 
-    # Auto-filter on profile change
-    if st.session_state.listings_df is not None and major.strip() and gpa > 0:
+    states = [s.upper() for s in states]
+    primary_state = states[0] if states else ""
+
+    st.markdown("##### Resume")
+    uploaded_files = st.file_uploader(
+        "Upload resume(s) (.txt or .pdf)",
+        type=["txt", "pdf"],
+        accept_multiple_files=True,
+        key="profile_resume_upload",
+    )
+    uploaded_text = _parse_resume_uploads(uploaded_files)
+    pasted_text = st.text_area(
+        "Or paste resume / background",
+        placeholder=(
+            "Paste resume text or extras:\n"
+            "• Key projects & technical skills\n"
+            "• Extracurriculars, interests, goals"
+        ),
+        height=160,
+        max_chars=10000,
+        key="profile_resume_paste",
+    )
+    resume_text = "\n\n".join(filter(None, [uploaded_text.strip(), pasted_text.strip()]))
+
+    # Auto-filter when listings exist and profile has enough signal.
+    if _is_career_mode:
+        profile_ready = bool(desired_role.strip() or major.strip())
+        can_filter = st.session_state.listings_df is not None and profile_ready
+    else:
+        profile_ready = bool(major.strip()) and gpa > 0
+        can_filter = st.session_state.listings_df is not None and profile_ready
+
+    if can_filter:
         if mode_key == "scholarship":
             st.session_state.matches_df = filter_scholarship_matches(
                 st.session_state.listings_df, major, gpa, states,
@@ -559,193 +810,52 @@ with st.sidebar:
                 location_pref, experience_level, desired_role=desired_role,
             )
 
-    st.divider()
+    draft_profile = {
+        "major": major,
+        "gpa": gpa,
+        "states": states,
+        "desired_role": desired_role,
+        "location_pref": location_pref,
+        "class_year": class_year,
+        "experience_level": experience_level,
+        "ethnicity": ethnicity,
+    }
 
-    # Supplemental info
-    st.markdown('<div class="slabel">Supplemental Information</div>', unsafe_allow_html=True)
-    st.caption(
-        "Upload files such as resumes, cover letters, or previous applications, "
-        "and paste anything else in the text box — the more detail, the better the drafts!"
-    )
-
-    uploaded_files = st.file_uploader(
-        "Upload resume(s) (.txt or .pdf)",
-        type=["txt", "pdf"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-    )
-
-    MAX_FILE_SIZE = 5 * 1024 * 1024
-    PDF_MAGIC = b"%PDF"
-
-    if "uploaded_file_cache" not in st.session_state:
-        st.session_state.uploaded_file_cache = {}
-
-    uploaded_text = ""
-    for f in uploaded_files:
-        cache_key = f"{f.name}_{f.size}"
-
-        if cache_key in st.session_state.uploaded_file_cache:
-            uploaded_text += st.session_state.uploaded_file_cache[cache_key] + "\n\n"
-            st.success(f"✅ {f.name}")
-            continue
-
-        if f.size > MAX_FILE_SIZE:
-            st.warning(f"⚠️ {f.name} exceeds 5 MB limit — skipped.")
-            continue
-
-        raw_bytes = f.read()
-
-        if f.type == "text/plain":
-            text = raw_bytes.decode("utf-8", errors="ignore")
-            st.session_state.uploaded_file_cache[cache_key] = text
-            uploaded_text += text + "\n\n"
-            st.success(f"✅ {f.name}")
-        elif f.type == "application/pdf":
-            if not raw_bytes[:4].startswith(PDF_MAGIC):
-                st.warning(f"⚠️ {f.name} doesn't appear to be a valid PDF — skipped.")
-                continue
-            try:
-                with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
-                    text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-                st.session_state.uploaded_file_cache[cache_key] = text
-                uploaded_text += text + "\n\n"
-                st.success(f"✅ {f.name}")
-            except Exception as e:
-                st.warning(f"PDF parse error ({f.name}): {e}")
-
-    pasted_text = st.text_area(
-        "Or paste your profile here",
-        placeholder=(
-            "Paste any other relevant info here, including:\n"
-            "• Key projects & technical skills\n"
-            "• Extracurriculars, interests, goals"
-        ),
-        height=180,
-        max_chars=10000,
-        label_visibility="collapsed",
-    )
-
-    resume_text = "\n\n".join(filter(None, [uploaded_text.strip(), pasted_text.strip()]))
-
-    st.markdown('<div class="slabel">Search settings</div>', unsafe_allow_html=True)
-    max_results = st.slider(
-        "Results per search angle",
-        1, 10, 3,
-        help="Each profile angle runs its own search. Total URLs are capped around 24.",
-    )
-
-    # Session status
-    st.divider()
-    if st.session_state.listings_df is not None:
-        count = len(st.session_state.listings_df)
-        st.markdown(
-            f'<div class="status-loaded">📂 Session results<br>'
-            f'<span style="opacity:0.7">{count} {mode_noun} in this browser session</span></div>',
-            unsafe_allow_html=True,
-        )
-        if st.button("🔁 Reset Session Data", use_container_width=True, key="btn_reset_session"):
-            st.session_state.listings_df = None
-            st.session_state.matches_df  = None
-            st.session_state.drafts      = {}
-            st.session_state.scout_done  = False
-            load_csv.clear()
-            st.rerun()
-    else:
-        st.caption(f"No {mode_noun} yet. Run a Scout to build results for this session.")
-
-
-# ── Header ────────────────────────────────────────────────────────────────────
-title_col, pill_col = st.columns([5, 1])
-with title_col:
-    st.markdown(f"# {MODE_TITLES[mode]}")
-    st.caption(MODE_SUBTITLES[mode])
-    st.caption("① Profile → ② Scout matches → ③ Draft cover letters")
-with pill_col:
-    if st.session_state.listings_df is not None:
-        n = len(st.session_state.listings_df)
-        st.markdown(
-            f'<div style="text-align:right;padding-top:1.25rem">'
-            f'<span class="tag">🗄 {n} in DB</span></div>',
-            unsafe_allow_html=True,
-        )
-
-st.divider()
-
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-_ENV_KEYS = {
-    "Gemini": os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY") or "",
-    "Claude": os.getenv("ANTHROPIC_API_KEY") or "",
-    "OpenAI": os.getenv("OPENAI_API_KEY") or "",
-    "Ollama": "",
-}
-active_api_key = user_api_key or _ENV_KEYS.get(provider, "") or ""
-api_key_set    = (provider == "Ollama") or bool(active_api_key)
-# Name is for drafts/sign-off — not required to scout.
-profile_ready  = bool(major.strip()) and gpa > 0
-if mode_key in ("internship", "job"):
-    profile_ready = profile_ready  # desired_role optional but improves ranking
-
-# The name column used to identify a listing in drafts/display
-_name_col = "name" if mode_key == "scholarship" else "company"
-_is_career_mode = mode_key in ("internship", "job")
-draft_profile = {
-    "major": major,
-    "gpa": gpa,
-    "states": states,
-    "desired_role": desired_role,
-    "location_pref": location_pref,
-    "class_year": class_year,
-    "experience_level": experience_level,
-    "ethnicity": ethnicity,
-}
-
-tab1, tab2, tab3 = st.tabs(["  🔍  Scout  ", "  📋  Matches  ", "  ✏️  Drafts  "])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TAB 1 — SCOUT
-# ─────────────────────────────────────────────────────────────────────────────
-with tab1:
-    st.markdown('<div class="tag">Step 01</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tag">Step 03 · Find</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="step-title">Scout {mode_noun.title()}</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div class="step-sub">Searches the web across multiple dimensions, '
-        'scrapes each page with AI, and saves results to your local database.</div>',
+        f'<div class="step-title">{FIND_LABELS[mode_key]}</div>',
         unsafe_allow_html=True,
     )
 
     if not api_key_set:
         st.warning(f"👈  Paste your {provider} API key in the sidebar to get started.")
     elif not profile_ready:
-        if st.session_state.listings_df is not None:
-            st.info(
-                f"📂 **{len(st.session_state.listings_df)} {mode_noun} already in this session.** "
-                "👈 Fill in Major and GPA — matches update as you refine your profile."
-            )
+        if _is_career_mode:
+            st.info("Enter a **desired role** and/or **field** above to start searching.")
         else:
-            st.info("👈  Fill in your Major and GPA in the sidebar to get started.")
+            st.info("Enter your **major** and **GPA** above to start searching.")
     else:
         if mode_key == "scholarship":
-            angles_preview = sum([bool(major), bool(states), bool(ethnicity), first_gen, income_based, True])
-        elif mode_key == "internship":
-            angles_preview = sum([bool(desired_role), bool(major), bool(states), location_pref == "Remote", bool(class_year), True])
+            angles_preview = sum([
+                bool(major), bool(states), bool(ethnicity), first_gen, income_based, True,
+            ])
         else:
-            angles_preview = sum([bool(desired_role), bool(major), bool(states), location_pref == "Remote", bool(experience_level), True])
-        est_min = max(1, round((angles_preview * max_results * 4) / 60))
+            # Board angles dominate; show a realistic board-first estimate.
+            angles_preview = 10 + sum([
+                bool(desired_role or major),
+                location_pref == "Remote",
+                bool(class_year if mode_key == "internship" else experience_level),
+            ])
+        est_min = max(1, round((min(angles_preview, 14) * max_results * 3) / 60))
         st.caption(
-            f"⏱ Estimated time: **{est_min}–{est_min + 1} min** "
-            f"({angles_preview} search angles × {max_results} URLs each, ~4s per site). "
-            "Feel free to grab a coffee ☕"
+            f"⏱ Estimated **{est_min}–{est_min + 2} min** · board-first discovery "
+            f"(~{max_results}+ results per angle, capped at ~24 URLs)."
         )
 
         btn_col, _ = st.columns([2, 3])
         with btn_col:
             scout_clicked = st.button(
-                "🚀  Start Scout",
+                f"🚀  {FIND_LABELS[mode_key]}",
                 type="primary",
                 disabled=st.session_state.is_scouting,
                 use_container_width=True,
@@ -754,6 +864,7 @@ with tab1:
 
         if scout_clicked:
             st.session_state.is_scouting = True
+            st.session_state.scout_stats = None
             st.rerun()
 
         if st.session_state.is_scouting:
@@ -767,7 +878,6 @@ with tab1:
                     if first_gen:    angles.append("first-generation")
                     if income_based: angles.append("need-based")
                     angles.append("general")
-
                     profile = {
                         "major": major,
                         "state": primary_state,
@@ -777,14 +887,12 @@ with tab1:
                         "income_based": income_based,
                     }
                 elif mode_key == "internship":
-                    angles = []
+                    angles = ["board sites"]
                     if desired_role: angles.append(f"role ({desired_role})")
                     if major:        angles.append(f"major ({major})")
-                    if state_label:  angles.append(f"states ({state_label})")
                     if location_pref == "Remote": angles.append("remote")
                     if class_year:   angles.append(f"class year ({class_year})")
-                    angles.append("general")
-
+                    angles.append("open-web fallback")
                     profile = {
                         "major": major,
                         "state": primary_state,
@@ -794,14 +902,12 @@ with tab1:
                         "class_year": class_year,
                     }
                 else:
-                    angles = []
+                    angles = ["board sites"]
                     if desired_role: angles.append(f"role ({desired_role})")
                     if major:        angles.append(f"field ({major})")
-                    if state_label:  angles.append(f"states ({state_label})")
                     if location_pref == "Remote": angles.append("remote")
                     if experience_level: angles.append(f"experience ({experience_level})")
-                    angles.append("general")
-
+                    angles.append("open-web fallback")
                     profile = {
                         "major": major,
                         "state": primary_state,
@@ -811,7 +917,7 @@ with tab1:
                         "experience_level": experience_level,
                     }
 
-                st.write(f"🔎 Running **{len(angles)} searches:** {', '.join(angles)}")
+                st.write(f"🔎 Running **{len(angles)} search angles:** {', '.join(angles)}")
 
                 urls = None
                 try:
@@ -828,7 +934,7 @@ with tab1:
                 if urls is not None and not urls:
                     st.session_state.is_scouting = False
                     status.update(
-                        label="⚠️ No URLs found. Try increasing URLs to Scout in the sidebar.",
+                        label="⚠️ No URLs found. Try raising scout budget in the sidebar.",
                         state="error", expanded=False,
                     )
                     urls = None
@@ -841,20 +947,22 @@ with tab1:
                 counter_box  = st.empty()
                 progress_bar = st.progress(0)
 
-                def ui_callback(url, site_num, total_sites, found_so_far, done=False):
-                    progress_bar.progress(site_num / total_sites)
+                def ui_callback(url, site_num, total_sites, found_so_far, done=False, stats=None, **_kwargs):
+                    progress_bar.progress(site_num / max(total_sites, 1))
+                    drop = _format_drop_reasons(stats, mode_noun) if stats else ""
                     if done:
                         counter_box.markdown(
                             f"✅ **All {total_sites} sites processed** · "
-                            f"**{found_so_far} active {mode_noun}** found"
+                            f"**{found_so_far} active {mode_noun}**\n\n{drop}"
                         )
                     else:
                         counter_box.markdown(
                             f"🌐 **Site {site_num} of {total_sites}** · "
-                            f"**{found_so_far} {mode_noun}** found so far"
+                            f"**{found_so_far} {mode_noun}** so far"
+                            + (f"\n\n{drop}" if drop else "")
                         )
 
-                df = run_pipeline(
+                df, scout_stats = run_pipeline(
                     urls,
                     mode=mode_key,
                     progress_callback=ui_callback,
@@ -863,48 +971,69 @@ with tab1:
                     ollama_host=ollama_host,
                 )
                 st.session_state.is_scouting = False
+                st.session_state.scout_stats = scout_stats
 
                 if df is not None and not df.empty:
                     if mode_key == "scholarship":
-                        matches = filter_scholarship_matches(df, major, gpa, states, ethnicity, first_gen, income_based)
+                        matches = filter_scholarship_matches(
+                            df, major, gpa, states, ethnicity, first_gen, income_based,
+                        )
                     elif mode_key == "internship":
                         matches = filter_internship_matches(
-                            df, major, gpa, states, location_pref, class_year, desired_role=desired_role,
+                            df, major, gpa, states, location_pref, class_year,
+                            desired_role=desired_role,
                         )
                     else:
                         matches = filter_job_matches(
-                            df, major, gpa, states, location_pref, experience_level, desired_role=desired_role,
+                            df, major, gpa, states, location_pref, experience_level,
+                            desired_role=desired_role,
                         )
 
                     st.session_state.listings_df = df
                     st.session_state.matches_df  = matches
                     st.session_state.scout_done  = True
-
-                    if len(df) == 0:
-                        status.update(
-                            label=f"⚠️ Sites scraped but 0 active {mode_noun} found. Try different search terms.",
-                            state="error", expanded=False,
-                        )
-                    else:
-                        status.update(
-                            label=f"✅ Scout complete — {len(df)} {mode_noun} found · {len(matches)} match your profile.",
-                            state="complete", expanded=False,
-                        )
-                else:
                     status.update(
-                        label=f"⚠️ No active {mode_noun} found. Try different search terms.",
+                        label=(
+                            f"✅ Scout complete — {len(df)} {mode_noun} found · "
+                            f"{len(matches)} match your profile."
+                        ),
+                        state="complete", expanded=False,
+                    )
+                else:
+                    st.session_state.listings_df = None
+                    st.session_state.matches_df = None
+                    st.session_state.scout_done = True
+                    status.update(
+                        label=(
+                            f"⚠️ 0 active {mode_noun}. "
+                            f"{_format_drop_reasons(scout_stats, mode_noun)}"
+                        ),
                         state="error",
-                        expanded=False,
+                        expanded=True,
                     )
 
+    # Explain empty / zero-active outcomes using last scout stats.
+    if (
+        st.session_state.scout_done
+        and (st.session_state.listings_df is None or st.session_state.listings_df.empty)
+        and st.session_state.scout_stats
+    ):
+        st.warning(
+            f"No active {mode_noun}. "
+            f"{_format_drop_reasons(st.session_state.scout_stats, mode_noun)}"
+        )
+
     # Database display
-    if st.session_state.listings_df is not None:
+    if st.session_state.listings_df is not None and not st.session_state.listings_df.empty:
         df = st.session_state.listings_df
         if mode_key == "internship" and "paid" in df.columns:
             df_display = df.drop(columns=["paid"])
         else:
             df_display = df
         st.markdown("---")
+
+        if st.session_state.scout_stats:
+            st.caption(_format_drop_reasons(st.session_state.scout_stats, mode_noun))
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Scraped", len(df))
@@ -944,7 +1073,6 @@ with tab1:
 
         st.dataframe(df_display, use_container_width=True, column_config=col_config, hide_index=True)
 
-        # Per-session full database download
         db_buf = StringIO()
         df.to_csv(db_buf, index=False)
         db_filename = f"{mode_key}_database_session.csv"
@@ -959,8 +1087,8 @@ with tab1:
         if st.session_state.scout_done:
             n_m = len(st.session_state.matches_df) if st.session_state.matches_df is not None else 0
             st.success(
-                f"**Step 1 complete!** {len(df)} {mode_noun} found — {n_m} match your profile. "
-                "👉 Click the **Matches** tab to review them."
+                f"**Find complete!** {len(df)} {mode_noun} found — {n_m} match your profile. "
+                "👉 Open the **Matches** tab to review them."
             )
 
 
@@ -968,7 +1096,7 @@ with tab1:
 # TAB 2 — MATCHES
 # ─────────────────────────────────────────────────────────────────────────────
 with tab2:
-    st.markdown('<div class="tag">Step 02</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tag">Matches</div>', unsafe_allow_html=True)
     st.markdown('<div class="step-title">Your Matches</div>', unsafe_allow_html=True)
 
     if mode_key == "scholarship":
@@ -979,23 +1107,23 @@ with tab2:
         )
     elif mode_key == "internship":
         st.markdown(
-            '<div class="step-sub">Ranked by role fit, major, location, and class year. '
+            '<div class="step-sub">Ranked by role fit, field, location, and class year. '
             "Best matches first.</div>",
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            '<div class="step-sub">Ranked by role fit, major, location, and experience level. '
+            '<div class="step-sub">Ranked by role fit, field, location, and experience level. '
             "Best matches first.</div>",
             unsafe_allow_html=True,
         )
 
     if st.session_state.matches_df is None:
-        st.info("Run a Scout first, or fill in your profile to filter the existing database.")
+        st.info(f"Run **{FIND_LABELS[mode_key]}** first, or refine your profile to filter results.")
     elif st.session_state.matches_df.empty:
         st.warning(
             f"No matches for your current profile. Try broadening your filters "
-            "or clearing the database and running a fresh Scout."
+            f"or resetting and running **{FIND_LABELS[mode_key]}** again."
         )
     else:
         matches = st.session_state.matches_df
@@ -1006,8 +1134,8 @@ with tab2:
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Matches Found", len(matches))
-        c2.metric("Your GPA",      f"{gpa:.1f}")
-        c3.metric("Field",          major or "—")
+        c2.metric("Your GPA", f"{gpa:.1f}" if gpa and gpa > 0 else "—")
+        c3.metric("Field", major or desired_role or "—")
 
         if mode_key == "scholarship":
             col_config = {
@@ -1039,8 +1167,8 @@ with tab2:
         )
 
         st.success(
-            f"**Step 2 complete!** {len(matches)} match(es), best fits first. "
-            "👉 Open **Drafts**, add your resume, and generate letters for the top matches."
+            f"**{len(matches)} match(es)**, best fits first. "
+            "👉 Open **Drafts**, confirm your resume on the Find tab, and generate letters."
         )
 
 
@@ -1048,7 +1176,7 @@ with tab2:
 # TAB 3 — DRAFTS
 # ─────────────────────────────────────────────────────────────────────────────
 with tab3:
-    st.markdown('<div class="tag">Step 03</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tag">Drafts</div>', unsafe_allow_html=True)
     st.markdown('<div class="step-title">Draft cover letters</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="step-sub">'
@@ -1064,9 +1192,9 @@ with tab3:
     if not api_key_set:
         st.warning(f"👈  Paste your {provider} API key in the sidebar to generate drafts.")
     elif no_matches:
-        st.info("Complete Scout + Matches first so there is something to draft for.")
+        st.info(f"Complete **{FIND_LABELS[mode_key]}** + Matches first so there is something to draft for.")
     elif no_resume:
-        st.warning("👈  Upload a resume or paste your background in the sidebar before drafting.")
+        st.warning("Upload a resume or paste your background on the **Find** tab before drafting.")
     else:
         matches = st.session_state.matches_df
         max_draftable = min(10, len(matches))
@@ -1079,7 +1207,7 @@ with tab3:
             help="Drafts the highest-ranked matches first to save time and API cost.",
         )
         if not name.strip():
-            st.caption("Tip: add your Full Name in the sidebar for a correct sign-off.")
+            st.caption("Tip: add your Full Name on the Find tab for a correct sign-off.")
 
         st.write(
             f"Ready to draft **{draft_n}** letter(s) for **{name or 'you'}** "
